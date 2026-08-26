@@ -1,0 +1,858 @@
+Option Explicit
+
+'===============================================================================
+' OUTIL DE PLANIFICATION ET DE GENERATION DE GANTT PAR RESSOURCE
+'
+' Cette macro travaille à partir de la feuille "DATA KPI".
+'
+' Elle permet :
+' - de planifier automatiquement les tâches qui ne possèdent pas encore de dates ;
+' - de traiter les tâches selon leur niveau de priorité ;
+' - de rechercher le premier créneau disponible pour chaque ressource ;
+' - de convertir les durées renseignées en heures en jours ouvrés ;
+' - de créer une feuille de Gantt pour chaque ressource ;
+' - d'afficher les tâches sur une frise chronologique journalière.
+'
+' Les feuilles générées commencent par le préfixe "GANTT_".
+' Elles peuvent donc être supprimées et régénérées sans toucher aux autres
+' feuilles du classeur.
+'===============================================================================
+
+
+'===============================================================================
+' FONCTIONS UTILITAIRES
+'===============================================================================
+
+Private Function SafeSheetName(ByVal S As String) As String
+
+    ' Nettoie le nom d'une ressource avant de l'utiliser comme nom de feuille.
+    '
+    ' Excel interdit certains caractères dans les noms de feuilles.
+    ' Ils sont donc remplacés par des espaces.
+    '
+    ' La longueur est limitée à 25 caractères afin de conserver suffisamment
+    ' de place pour ajouter le préfixe "GANTT_" sans dépasser la limite Excel
+    ' de 31 caractères.
+
+    Dim badChars As Variant
+    Dim ch As Variant
+
+    badChars = Array("/", "\", "?", "*", "[", "]", ":")
+
+    For Each ch In badChars
+        S = Replace(S, ch, " ")
+    Next ch
+
+    S = Trim(S)
+
+    ' Si aucun nom de ressource n'est renseigné, un nom générique est utilisé.
+    If S = "" Then S = "Sans_Ressource"
+
+    SafeSheetName = Left(S, 25)
+
+End Function
+
+
+Private Function DayLetterFR(ByVal d As Date) As String
+
+    ' Retourne l'initiale française du jour de la semaine.
+    '
+    ' Le calcul commence le lundi afin d'obtenir l'ordre suivant :
+    ' L, M, M, J, V, S, D.
+    '
+    ' Cette fonction est utilisée pour construire la ligne journalière
+    ' de la frise chronologique.
+
+    Select Case Weekday(d, vbMonday)
+
+        Case 1
+            DayLetterFR = "L"
+
+        Case 2
+            DayLetterFR = "M"
+
+        Case 3
+            DayLetterFR = "M"
+
+        Case 4
+            DayLetterFR = "J"
+
+        Case 5
+            DayLetterFR = "V"
+
+        Case 6
+            DayLetterFR = "S"
+
+        Case 7
+            DayLetterFR = "D"
+
+    End Select
+
+End Function
+
+
+'===============================================================================
+' GENERATION DES FEUILLES DE GANTT
+'
+' Cette procédure crée une feuille par ressource à partir des tâches présentes
+' dans la feuille "DATA KPI".
+'
+' Les tâches doivent déjà posséder une date de début et une date de fin.
+' La procédure "Planifier_Automatiquement" peut être exécutée auparavant
+' pour calculer les dates manquantes.
+'===============================================================================
+
+Sub Generer_Gantt_Par_Ressource()
+
+    '---------------------------------------------------------------------------
+    ' Paramètres de mise en page
+    '
+    ' Les colonnes A à F contiennent les informations descriptives.
+    ' La frise chronologique commence en colonne G.
+    '
+    ' Une ligne vide est conservée entre deux tâches afin d'améliorer
+    ' la lisibilité du Gantt.
+    '---------------------------------------------------------------------------
+
+    Const COL_START_TIMELINE As Long = 7
+    Const HEADER_ROW As Long = 6
+    Const FIRST_TASK_ROW As Long = 7
+    Const ROW_STEP As Long = 2
+
+    Dim wb As Workbook
+    Dim wsData As Worksheet
+    Dim ws As Worksheet
+
+    Dim LastRow As Long
+    Dim r As Long
+    Dim i As Long
+
+    Dim FirstDate As Date
+    Dim LastDate As Date
+
+    Dim dict As Object
+    Dim RowRes As Object
+
+    Dim ResourceName As String
+    Dim ResourceKey As Variant
+
+    Dim StartCol As Long
+    Dim EndCol As Long
+    Dim col As Long
+    Dim TaskRow As Long
+
+    Set wb = ThisWorkbook
+    Set wsData = wb.Worksheets("DATA KPI")
+
+    ' Désactivation temporaire de l'affichage afin d'accélérer la génération.
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+
+    '===========================================================================
+    ' SUPPRESSION DES ANCIENNES FEUILLES DE GANTT
+    '
+    ' Seules les feuilles dont le nom commence par "GANTT_" sont supprimées.
+    ' Les données d'origine et les autres feuilles ne sont donc pas affectées.
+    '===========================================================================
+
+    For i = wb.Worksheets.Count To 1 Step -1
+
+        If Left(wb.Worksheets(i).Name, 6) = "GANTT_" Then
+            wb.Worksheets(i).Delete
+        End If
+
+    Next i
+
+    Application.DisplayAlerts = True
+
+
+    ' Recherche de la dernière ligne contenant une tâche.
+    LastRow = wsData.Cells(wsData.Rows.Count, "C").End(xlUp).Row
+
+
+    '===========================================================================
+    ' TRI CHRONOLOGIQUE DES DONNEES
+    '
+    ' Les tâches sont triées selon leur date de début située en colonne H.
+    ' Cela permet de les afficher dans l'ordre chronologique sur les différentes
+    ' feuilles de ressources.
+    '===========================================================================
+
+    With wsData.Sort
+
+        .SortFields.Clear
+
+        .SortFields.Add _
+            Key:=wsData.Range("H2:H" & LastRow), _
+            SortOn:=xlSortOnValues, _
+            Order:=xlAscending
+
+        .SetRange wsData.Range("A1:R" & LastRow)
+        .Header = xlYes
+        .Apply
+
+    End With
+
+
+    '===========================================================================
+    ' DETERMINATION DE LA PERIODE GLOBALE
+    '
+    ' La date la plus ancienne et la date la plus récente sont recherchées
+    ' dans l'ensemble des tâches.
+    '
+    ' Cette période commune est ensuite utilisée pour construire la même
+    ' frise chronologique sur toutes les feuilles de Gantt.
+    '===========================================================================
+
+    FirstDate = DateSerial(2099, 12, 31)
+    LastDate = DateSerial(1900, 1, 1)
+
+    For r = 2 To LastRow
+
+        ' Recherche de la date de début la plus ancienne.
+        If IsDate(wsData.Cells(r, "H").Value) Then
+
+            If wsData.Cells(r, "H").Value < FirstDate Then
+                FirstDate = wsData.Cells(r, "H").Value
+            End If
+
+        End If
+
+        ' Recherche de la date de fin la plus récente.
+        If IsDate(wsData.Cells(r, "I").Value) Then
+
+            If wsData.Cells(r, "I").Value > LastDate Then
+                LastDate = wsData.Cells(r, "I").Value
+            End If
+
+        End If
+
+    Next r
+
+
+    ' Le dictionnaire associe chaque ressource au nom de sa feuille de Gantt.
+    ' Il évite de créer plusieurs feuilles pour une même ressource.
+    Set dict = CreateObject("Scripting.Dictionary")
+
+
+    '===========================================================================
+    ' CREATION DES FEUILLES PAR RESSOURCE
+    '===========================================================================
+
+    For r = 2 To LastRow
+
+        ResourceName = Trim(wsData.Cells(r, "N").Value)
+
+        ' Les tâches sans ressource sont regroupées dans une feuille dédiée.
+        If ResourceName = "" Then
+            ResourceName = "Sans_Ressource"
+        End If
+
+        ResourceName = SafeSheetName(ResourceName)
+
+        ' La feuille est créée uniquement lors de la première apparition
+        ' de la ressource dans la table.
+        If Not dict.Exists(ResourceName) Then
+
+            Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+
+            ws.Name = "GANTT_" & ResourceName
+
+            dict.Add ResourceName, ws.Name
+
+            ' Création des en-têtes et de la frise chronologique.
+            InitialiserFeuilleGantt ws, FirstDate, LastDate
+
+        End If
+
+    Next r
+
+
+    ' Le dictionnaire RowRes mémorise la prochaine ligne disponible
+    ' dans chaque feuille de Gantt.
+    Set RowRes = CreateObject("Scripting.Dictionary")
+
+    For Each ResourceKey In dict.Keys
+        RowRes.Add CStr(ResourceKey), FIRST_TASK_ROW
+    Next ResourceKey
+
+
+    '===========================================================================
+    ' AJOUT DES TACHES DANS LES FEUILLES
+    '
+    ' Chaque tâche est envoyée vers la feuille correspondant à sa ressource.
+    ' Ses informations sont ajoutées dans les colonnes A à F, puis sa barre
+    ' de Gantt est dessinée sur la frise.
+    '===========================================================================
+
+    For r = 2 To LastRow
+
+        ' Une tâche ne peut être représentée que si ses deux dates sont valides.
+        If IsDate(wsData.Cells(r, "H").Value) _
+        And IsDate(wsData.Cells(r, "I").Value) Then
+
+            ResourceName = Trim(wsData.Cells(r, "N").Value)
+
+            If ResourceName = "" Then
+                ResourceName = "Sans_Ressource"
+            End If
+
+            ResourceName = SafeSheetName(ResourceName)
+
+            Set ws = wb.Worksheets(dict(ResourceName))
+
+            TaskRow = RowRes(ResourceName)
+
+
+            '-------------------------------------------------------------------
+            ' Récupération des informations de la tâche
+            '
+            ' Colonne A : projet
+            ' Colonne B : nom de la tâche
+            ' Colonne C : date de début
+            ' Colonne D : date de fin
+            ' Colonne E : ressource
+            ' Colonne F : pourcentage d'avancement
+            '-------------------------------------------------------------------
+
+            ws.Cells(TaskRow, 1).Value = wsData.Cells(r, "B").Value
+            ws.Cells(TaskRow, 2).Value = wsData.Cells(r, "C").Value
+            ws.Cells(TaskRow, 3).Value = wsData.Cells(r, "H").Value
+            ws.Cells(TaskRow, 4).Value = wsData.Cells(r, "I").Value
+            ws.Cells(TaskRow, 5).Value = wsData.Cells(r, "N").Value
+            ws.Cells(TaskRow, 6).Value = wsData.Cells(r, "O").Value
+
+            ws.Cells(TaskRow, 6).NumberFormat = "0%"
+
+
+            ' Conversion des dates en numéros de colonnes.
+            '
+            ' Une colonne correspond à une journée. Le décalage est calculé
+            ' par rapport à la première date de l'ensemble du planning.
+            StartCol = COL_START_TIMELINE + _
+                       (Int(CDate(wsData.Cells(r, "H").Value)) - FirstDate)
+
+            EndCol = COL_START_TIMELINE + _
+                     (Int(CDate(wsData.Cells(r, "I").Value)) - FirstDate)
+
+            ' Une tâche ne peut pas avoir une barre de longueur négative.
+            If EndCol < StartCol Then EndCol = StartCol
+
+
+            ' Coloration des cellules comprises entre le début et la fin
+            ' de la tâche afin de représenter la barre de Gantt.
+            For col = StartCol To EndCol
+
+                ws.Cells(TaskRow, col).Interior.Color = RGB(91, 155, 213)
+
+            Next col
+
+
+            ' Passage à la prochaine ligne disponible de la feuille.
+            RowRes(ResourceName) = TaskRow + ROW_STEP
+
+        End If
+
+    Next r
+
+
+    '===========================================================================
+    ' MISE EN FORME FINALE
+    '===========================================================================
+
+    For Each ResourceKey In dict.Keys
+
+        Set ws = wb.Worksheets(dict(CStr(ResourceKey)))
+
+        ' Ajustement automatique de la largeur des colonnes descriptives.
+        ws.Columns("A:F").AutoFit
+
+        ws.Activate
+
+        ' Gel des lignes d'en-tête et des six premières colonnes.
+        '
+        ' Cela permet de conserver les informations de la tâche visibles
+        ' lorsque l'utilisateur se déplace dans une longue frise.
+        ActiveWindow.SplitRow = HEADER_ROW
+        ActiveWindow.SplitColumn = 6
+        ActiveWindow.FreezePanes = True
+
+    Next ResourceKey
+
+    Application.ScreenUpdating = True
+
+    MsgBox "Gantt par ressource généré.", vbInformation
+
+End Sub
+
+
+'===============================================================================
+' INITIALISATION D'UNE FEUILLE DE GANTT
+'
+' Cette procédure prépare une nouvelle feuille avec :
+' - le nom de la ressource ;
+' - les en-têtes descriptifs ;
+' - une frise chronologique quotidienne ;
+' - les repères d'année, de mois et de semaine ;
+' - une couleur particulière pour les week-ends.
+'===============================================================================
+
+Private Sub InitialiserFeuilleGantt( _
+    ByVal ws As Worksheet, _
+    ByVal FirstDate As Date, _
+    ByVal LastDate As Date)
+
+    Const COL_START_TIMELINE As Long = 7
+
+    Dim col As Long
+    Dim dt As Date
+
+
+    ' Le titre reprend le nom de la ressource sans le préfixe "GANTT_".
+    ws.Range("A1").Value = Replace(ws.Name, "GANTT_", "")
+
+    ws.Range("A1").Font.Bold = True
+    ws.Range("A1").Font.Size = 16
+
+
+    ' Création des en-têtes de la partie descriptive.
+    ws.Range("A6:F6").Value = Array( _
+        "Projet", _
+        "Tâche", _
+        "Début", _
+        "Fin", _
+        "Ressource", _
+        "% Achevé")
+
+    ws.Range("A6:F6").Font.Bold = True
+    ws.Range("A6:F6").Interior.Color = RGB(230, 230, 230)
+
+
+    '===========================================================================
+    ' CONSTRUCTION DE LA FRISE CHRONOLOGIQUE
+    '
+    ' Ligne 2 : année
+    ' Ligne 3 : mois
+    ' Ligne 4 : date des lundis
+    ' Ligne 5 : initiale du jour
+    '===========================================================================
+
+    col = COL_START_TIMELINE
+
+    For dt = FirstDate To LastDate
+
+        ' L'année est affichée le premier janvier.
+        If Month(dt) = 1 And Day(dt) = 1 Then
+            ws.Cells(2, col).Value = Year(dt)
+        End If
+
+        ' Le nom du mois est affiché lors de son premier jour.
+        If Day(dt) = 1 Then
+            ws.Cells(3, col).Value = Format(dt, "mmmm")
+        End If
+
+        ' La date est affichée uniquement le lundi afin de fournir
+        ' un repère hebdomadaire sans surcharger la frise.
+        If Weekday(dt, vbMonday) = 1 Then
+            ws.Cells(4, col).Value = Format(dt, "dd/mm")
+        End If
+
+        ' Initiale française du jour.
+        ws.Cells(5, col).Value = DayLetterFR(dt)
+
+        ' Chaque journée est représentée par une colonne étroite.
+        ws.Columns(col).ColumnWidth = 2
+
+        ' Les samedis et dimanches sont légèrement grisés.
+        If Weekday(dt, vbMonday) >= 6 Then
+
+            ws.Range( _
+                ws.Cells(2, col), _
+                ws.Cells(5000, col) _
+            ).Interior.Color = RGB(245, 245, 245)
+
+        End If
+
+        col = col + 1
+
+    Next dt
+
+End Sub
+
+
+'===============================================================================
+' PLANIFICATION AUTOMATIQUE DES TACHES
+'
+' Cette procédure traite les tâches qui :
+' - ne possèdent pas encore de date de début en colonne H ;
+' - disposent d'une ressource en colonne N.
+'
+' Elles sont classées par priorité décroissante avant d'être planifiées.
+' Pour chaque tâche, la macro recherche ensuite le premier créneau disponible
+' dans le calendrier de la ressource.
+'===============================================================================
+
+Sub Planifier_Automatiquement()
+
+    Dim ws As Worksheet
+    Dim LastRow As Long
+    Dim Taches() As Variant
+    Dim NbTaches As Long
+
+    Dim r As Long
+    Dim i As Long
+    Dim j As Long
+
+    Dim tmpRow As Variant
+    Dim tmpPrio As Variant
+
+    Dim DureeH As Double
+    Dim NbJours As Long
+    Dim Ressource As String
+
+    Dim DateDebut As Date
+    Dim DateFin As Date
+
+    Set ws = ThisWorkbook.Worksheets("DATA KPI")
+
+    LastRow = ws.Cells(ws.Rows.Count, "C").End(xlUp).Row
+
+    NbTaches = 0
+
+
+    '===========================================================================
+    ' IDENTIFICATION DES TACHES A PLANIFIER
+    '
+    ' Le tableau Taches mémorise :
+    ' - la ligne de la tâche dans DATA KPI ;
+    ' - sa priorité située en colonne R.
+    '===========================================================================
+
+    For r = 2 To LastRow
+
+        ' Seules les tâches qui ne possèdent pas de date de début sont retenues.
+        If Trim(ws.Cells(r, "H").Value) = "" Then
+
+            ' Une ressource doit être renseignée pour effectuer la planification.
+            If Trim(ws.Cells(r, "N").Value) <> "" Then
+
+                NbTaches = NbTaches + 1
+
+                ReDim Preserve Taches(1 To 2, 1 To NbTaches)
+
+                Taches(1, NbTaches) = r
+                Taches(2, NbTaches) = Val(ws.Cells(r, "R").Value)
+
+            End If
+
+        End If
+
+    Next r
+
+
+    If NbTaches = 0 Then
+
+        MsgBox "Aucune tâche à planifier."
+        Exit Sub
+
+    End If
+
+
+    '===========================================================================
+    ' TRI DES TACHES PAR PRIORITE DECROISSANTE
+    '
+    ' Les tâches les plus prioritaires sont traitées en premier afin qu'elles
+    ' puissent bénéficier des premiers créneaux disponibles.
+    '===========================================================================
+
+    For i = 1 To NbTaches - 1
+
+        For j = i + 1 To NbTaches
+
+            If CDbl(Taches(2, j)) > CDbl(Taches(2, i)) Then
+
+                ' Mémorisation temporaire de la ligne et de la priorité.
+                tmpRow = Taches(1, i)
+                tmpPrio = Taches(2, i)
+
+                ' La tâche la plus prioritaire remonte dans le tableau.
+                Taches(1, i) = Taches(1, j)
+                Taches(2, i) = Taches(2, j)
+
+                Taches(1, j) = tmpRow
+                Taches(2, j) = tmpPrio
+
+            End If
+
+        Next j
+
+    Next i
+
+
+    '===========================================================================
+    ' PLANIFICATION DES TACHES
+    '===========================================================================
+
+    For i = 1 To NbTaches
+
+        ' Récupération de la ligne DATA KPI associée à la tâche.
+        r = Taches(1, i)
+
+        Ressource = Trim(ws.Cells(r, "N").Value)
+
+
+        '-----------------------------------------------------------------------
+        ' Conversion de la durée en jours
+        '
+        ' La durée est renseignée en heures dans la colonne J.
+        ' Une journée de travail est considérée ici comme égale à sept heures.
+        '
+        ' Si la durée est absente ou incorrecte, une journée est utilisée
+        ' par défaut.
+        '-----------------------------------------------------------------------
+
+        DureeH = ExtraireHeures(ws.Cells(r, "J").Text)
+
+        If DureeH <= 0 Then DureeH = 7
+
+        NbJours = WorksheetFunction.RoundUp(DureeH / 7, 0)
+
+
+        ' Recherche du premier intervalle suffisamment long dans le planning
+        ' de la ressource.
+        DateDebut = PremierTrouDisponible( _
+                        ws, _
+                        Ressource, _
+                        NbJours)
+
+        ' Calcul de la date de fin en excluant les samedis et dimanches.
+        DateFin = AjouterJoursOuvres(DateDebut, NbJours - 1)
+
+
+        ' Les informations suivantes sont visibles dans la fenêtre Exécution
+        ' de VBA. Elles servent à contrôler la logique pendant les tests.
+        Debug.Print "TACHE : " & ws.Cells(r, "C").Value
+        Debug.Print "RESSOURCE : " & Ressource
+        Debug.Print "DUREE H : " & DureeH
+        Debug.Print "NB JOURS : " & NbJours
+        Debug.Print "DEBUT PROPOSE : " & Format(DateDebut, "dd/mm/yyyy")
+        Debug.Print "FIN PROPOSEE : " & Format(DateFin, "dd/mm/yyyy")
+        Debug.Print "--------------------------------"
+
+
+        ' Ecriture des dates calculées dans DATA KPI.
+        ws.Cells(r, "H").Value = DateDebut
+        ws.Cells(r, "I").Value = DateFin
+
+    Next i
+
+    MsgBox "Planification terminée."
+
+End Sub
+
+
+'===============================================================================
+' RECHERCHE JOUR PAR JOUR D'UN CRENEAU DISPONIBLE
+'
+' Cette fonction teste les jours ouvrés les uns après les autres afin de trouver
+' une période pendant laquelle la ressource n'est affectée à aucune autre tâche.
+'
+' Cette fonction constitue une méthode alternative à PremierTrouDisponible.
+' Elle peut être conservée pour réaliser des tests ou pour une future évolution.
+'===============================================================================
+
+Private Function TrouverPremierCreneau( _
+                    ws As Worksheet, _
+                    Ressource As String, _
+                    NbJours As Long, _
+                    DateMini As Date) As Date
+
+    Dim TestDate As Date
+    Dim LastRow As Long
+    Dim r As Long
+
+    Dim DebutOccupe As Date
+    Dim FinOccupe As Date
+
+    Dim Libre As Boolean
+    Dim i As Long
+    Dim JourTest As Date
+
+    LastRow = ws.Cells(ws.Rows.Count, "C").End(xlUp).Row
+
+    TestDate = DateMini
+
+    ' Aucune nouvelle tâche ne doit être planifiée dans le passé.
+    If TestDate < Date Then
+        TestDate = Date
+    End If
+
+    ' Positionnement sur le premier jour ouvré disponible.
+    TestDate = JourOuvreSuivant(TestDate - 1)
+
+    Do
+
+        Libre = True
+
+
+        ' Test de chaque journée nécessaire à la réalisation de la tâche.
+        For i = 0 To NbJours - 1
+
+            JourTest = AjouterJoursOuvres(TestDate, i)
+
+
+            ' Comparaison avec toutes les activités existantes de la ressource.
+            For r = 2 To LastRow
+
+                If Trim(ws.Cells(r, "N").Value) = Ressource Then
+
+                    If IsDate(ws.Cells(r, "H").Value) _
+                    And IsDate(ws.Cells(r, "I").Value) Then
+
+                        DebutOccupe = ws.Cells(r, "H").Value
+                        FinOccupe = ws.Cells(r, "I").Value
+
+                        ' Le créneau n'est pas libre si une journée de la tâche
+                        ' se trouve dans une activité déjà planifiée.
+                        If JourTest >= DebutOccupe _
+                        And JourTest <= FinOccupe Then
+
+                            Libre = False
+                            Exit For
+
+                        End If
+
+                    End If
+
+                End If
+
+            Next r
+
+            If Not Libre Then Exit For
+
+        Next i
+
+
+        ' Si toutes les journées ont été validées, le créneau est retourné.
+        If Libre Then
+
+            TrouverPremierCreneau = TestDate
+            Exit Function
+
+        End If
+
+
+        ' Sinon, la recherche reprend au jour ouvré suivant.
+        TestDate = JourOuvreSuivant(TestDate)
+
+    Loop
+
+End Function
+
+
+'===============================================================================
+' CONVERSION D'UNE DUREE TEXTE EN NOMBRE D'HEURES
+'===============================================================================
+
+Private Function ExtraireHeures(Texte As String) As Double
+
+    ' Nettoie une durée saisie sous une forme telle que :
+    ' "7 h", "14h", "10,5 h" ou "10.5".
+    '
+    ' Le résultat est retourné sous la forme d'un nombre d'heures.
+
+    Dim S As String
+
+    S = Replace(Texte, " h", "")
+    S = Replace(S, "h", "")
+    S = Replace(S, ",", ".")
+
+    If IsNumeric(S) Then
+        ExtraireHeures = CDbl(S)
+    Else
+        ExtraireHeures = 0
+    End If
+
+End Function
+
+
+'===============================================================================
+' GESTION DES JOURS OUVRES
+'===============================================================================
+
+Private Function JourOuvreSuivant(ByVal d As Date) As Date
+
+    ' Retourne le prochain jour ouvré après la date reçue.
+    '
+    ' Les samedis et dimanches sont automatiquement ignorés.
+    ' Les jours fériés ne sont pas gérés dans cette version.
+
+    d = d + 1
+
+    Do While Weekday(d, vbMonday) > 5
+        d = d + 1
+    Loop
+
+    JourOuvreSuivant = d
+
+End Function
+
+
+Private Function AjouterJoursOuvres( _
+                    ByVal d As Date, _
+                    ByVal NbJours As Long) As Date
+
+    ' Ajoute un nombre de jours ouvrés à une date.
+    '
+    ' Cette fonction est utilisée pour calculer la date de fin d'une tâche
+    ' à partir de sa date de début et de sa durée.
+
+    Dim i As Long
+
+    For i = 1 To NbJours
+
+        d = d + 1
+
+        ' Passage automatique au lundi lorsqu'un week-end est rencontré.
+        Do While Weekday(d, vbMonday) > 5
+            d = d + 1
+        Loop
+
+    Next i
+
+    AjouterJoursOuvres = d
+
+End Function
+
+
+Private Function NombreJoursOuvres( _
+                    DateDebut As Date, _
+                    DateFin As Date) As Long
+
+    ' Compte le nombre de jours compris entre deux dates en excluant
+    ' les samedis et les dimanches.
+    '
+    ' Cette fonction permet de vérifier qu'un espace libre entre deux tâches
+    ' est suffisamment long pour accueillir une nouvelle activité.
+
+    Dim d As Date
+
+    For d = DateDebut To DateFin
+
+        If Weekday(d, vbMonday) <= 5 Then
+            NombreJoursOuvres = NombreJoursOuvres + 1
+        End If
+
+    Next d
+
+End Function
+
+
+'===============================================================================
+' RECHERCHE DU PREMIER INTERVALLE DISPONIBLE POUR UNE RESSOURCE
+'
+' Cette fonction constitue le cœur de la planification automatique.
+'
+' Son fonctionnement est le suivant :
+' 1. récupérer toutes les tâches d
