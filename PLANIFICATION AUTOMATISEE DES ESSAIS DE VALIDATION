@@ -1,0 +1,1186 @@
+'===============================================================================
+' ANNEXE 3 - PLANIFICATION AUTOMATISEE DES ESSAIS DE VALIDATION
+'
+' Ce module génère un planning prévisionnel des essais d'un projet ferroviaire.
+' Il lit les essais, leurs configurations et leurs durées, puis recherche les
+' trains capables de les réaliser en respectant les contraintes disponibles.
+'
+' Les principales règles prises en compte sont :
+' - la priorité et la durée de chaque essai ;
+' - les configurations Single Unit et Multiple Unit ;
+' - la famille et la disponibilité des trains ;
+' - la date à laquelle un train devient fitted ;
+' - le site, le laboratoire, le transport et les opérations de tuning ;
+' - la répartition de la charge entre les différents trains ;
+' - la génération d'un tableau hebdomadaire de chiffrage.
+'
+' Les commentaires décrivent volontairement la logique métier et le rôle de
+' chaque procédure. Ils doivent permettre à une autre personne de comprendre
+' et de reprendre l'outil sans devoir analyser chaque instruction isolément.
+'===============================================================================
+
+Option Explicit
+
+' ============================================================================
+' PARAMETRES GENERAUX ET REGLES D'ARBITRAGE
+' ============================================================================
+Private Const START_WEEK_COL As Long = 6
+Private Const MAX_WEEK_COL As Long = 300
+Private Const DEFAULT_TEST_DURATION As Long = 1
+Private Const TRANSPORT_DURATION As Long = 1
+Private Const DEFAULT_PLACE As String = "SITE_TEST"
+Private Const DEFAULT_LABO As String = ""
+
+Private Const EXTERNAL_FILE As String = "C:\Users\554860\OneDrive - Alstom\Liste Essai.xlsx"
+Private Const TEST_LIST_EXT_SHEET As String = "Liste Essais"
+Private Const CARRY_OVER_SHEET As String = "Carry Over"
+Private Const TUNING_SHEET As String = "Tuning Time"
+Private Const FOLLOWUP_SHEET As String = "Revision followup"
+
+' Liste Essais : H = Carry Over, I = Fitted
+Private Const EXT_CARRY_OVER_COL As Long = 8
+Private Const EXT_FITTED_COL As Long = 9
+' Carry Over : A:G structure test, H+ projets
+Private Const FIRST_PROJECT_COL As Long = 8
+' test list : H = nom du projet
+Private Const TEST_PROJECT_COL As Long = 8
+
+' Arbitrage : terminer vite avant de supprimer tous les transports.
+Private Const WEEK_DELAY_PENALTY As Double = 1000
+Private Const TRANSPORT_PENALTY As Double = 600
+Private Const TOTAL_LOAD_WEIGHT As Double = 10
+Private Const LOCAL_LOAD_WEIGHT As Double = 180
+Private Const CONSECUTIVE_LOAD_WEIGHT As Double = 250
+Private Const MAX_OPTIMIZATION_DELAY As Long = 3
+Private Const LOCAL_WINDOW As Long = 6
+
+Private Const STATIC_TUNING As String = "STATIC TUNING"
+Private Const DYNAMIC_TUNING As String = "DYNAMIC TUNING"
+
+' ============================================================================
+' LANCEMENT COMPLET
+' ============================================================================
+' Point d'entrée principal de l'outil.
+' La structure du planning est d'abord recréée, les essais sont ensuite
+' positionnés, puis le tableau de chiffrage est mis à jour à partir du résultat.
+Public Sub Generate_Full_Planning_And_Costing_V8()
+    Planning_Style_Alstom_V8
+    Generate_Macro_Planning_V8
+    UpdateCosting_V8
+End Sub
+
+' ============================================================================
+' PLANIFICATION PRINCIPALE : CHARGEMENT, TRI ET AFFECTATION
+' ============================================================================
+' Procédure principale de planification.
+' Elle charge les paramètres du projet, construit la liste des essais à traiter,
+' applique l'ordre de priorité et appelle l'algorithme d'affectation.
+' Les calculs et l'affichage Excel sont temporairement désactivés pour accélérer
+' le traitement, puis restaurés même si une erreur se produit.
+Public Sub Generate_Macro_Planning_V8()
+    On Error GoTo FatalError
+
+    Dim wsT As Worksheet, wsP As Worksheet
+    Dim OldCalc As XlCalculation
+    Set wsT = ThisWorkbook.Worksheets("test list")
+    Set wsP = ThisWorkbook.Worksheets("Macro planning")
+
+    OldCalc = Application.Calculation
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    Dim Families As Object, FittedDates As Object, TuningTimes As Object
+    Dim ConfigReqs As Object, ConfigCols As Object
+    Dim TestParams As Object, ProjectDurations As Object
+
+    Set Families = LoadTrainFamilies()
+    Set FittedDates = LoadTrainFittedDates()
+    Set TuningTimes = LoadTuningTimes()
+    Set ConfigReqs = LoadConfigRequirements()
+    Set ConfigCols = BuildConfigColumns(wsT, ConfigReqs)
+    LoadExternalProjectData TestParams, ProjectDurations
+
+    If Families.Count = 0 Then Err.Raise vbObjectError + 1, , "Aucun train dans Famille_Train."
+    If ConfigReqs.Count = 0 Then Err.Raise vbObjectError + 2, , "Aucune config dans Config_Train."
+    If ConfigCols.Count = 0 Then Err.Raise vbObjectError + 3, , "Aucune config reconnue en ligne 1 de test list."
+
+    ClearMacroPlanning wsP, Families
+
+    ' 1 priorité, 2 nom, 3 costing, 4 fitted local, 5 ligne, 6 config,
+    ' 7 exigences, 8 réservé, 9 couleur, 10 ID, 11 projet.
+    Dim Tasks(), N As Long, r As Long, ConfigKey As Variant
+    Dim ConfigCol As Long, Req As Object, MissingID As Long
+    Dim LastRow As Long
+    LastRow = wsT.Cells(wsT.Rows.Count, "G").End(xlUp).Row
+
+    For r = 2 To LastRow
+        If Trim$(CStr(wsT.Cells(r, "G").Value)) <> "" Then
+            For Each ConfigKey In ConfigCols.Keys
+                ConfigCol = CLng(ConfigCols(ConfigKey))
+                If UCase$(Trim$(CStr(wsT.Cells(r, ConfigCol).Value))) = "X" Then
+                    If NormalizeID(wsT.Cells(r, "E").Value) = "" Then
+                        MissingID = MissingID + 1
+                    Else
+                        Set Req = ConfigReqs(ConfigKey)
+                        N = N + 1
+                        ReDim Preserve Tasks(1 To 11, 1 To N)
+                        Tasks(1, N) = wsT.Cells(r, "J").Value
+                        Tasks(2, N) = wsT.Cells(r, "G").Value
+                        Tasks(3, N) = wsT.Cells(r, "P").Value
+                        Tasks(4, N) = wsT.Cells(r, "Q").Value
+                        Tasks(5, N) = r
+                        Tasks(6, N) = wsT.Cells(1, ConfigCol).Value
+                        Set Tasks(7, N) = Req
+                        Tasks(8, N) = ""
+                        Tasks(9, N) = wsT.Cells(r, "G").Interior.Color
+                        Tasks(10, N) = wsT.Cells(r, "E").Value
+                        Tasks(11, N) = wsT.Cells(r, TEST_PROJECT_COL).Value
+                    End If
+                End If
+            Next ConfigKey
+        End If
+    Next r
+
+    If N = 0 Then Err.Raise vbObjectError + 4, , "Aucune tâche à planifier."
+    SortTasks Tasks, N
+
+    Dim IDsWithSU As Object, SUFinish As Object
+    Set IDsWithSU = BuildIDsWithSU(Tasks, N)
+    Set SUFinish = CreateObject("Scripting.Dictionary")
+
+    Dim Planned As Long, Skipped As Long, MissingProjectDuration As Long
+    Dim TaskReq As Object, ID As String, ProjectName As String
+    Dim IsMU As Boolean, MinStart As Long, PlannedEnd As Long
+
+    For r = 1 To N
+        Application.StatusBar = "Planification " & r & "/" & N & " : " & CStr(Tasks(2, r))
+        Set TaskReq = Tasks(7, r)
+        ID = NormalizeID(Tasks(10, r))
+        ProjectName = Trim$(CStr(Tasks(11, r)))
+        IsMU = IsMUConfiguration(CStr(Tasks(6, r)), TaskReq)
+        MinStart = START_WEEK_COL
+        PlannedEnd = 0
+
+        If IsMU And IDsWithSU.Exists(ID) Then
+            If Not SUFinish.Exists(ID) Then
+                Skipped = Skipped + 1
+                GoTo NextTask
+            End If
+            MinStart = CLng(SUFinish(ID)) + 1
+        End If
+
+        Dim Duration As Long, DurationFound As Boolean
+        Duration = GetProjectDuration(ProjectDurations, ID, ProjectName, DurationFound)
+        If Not DurationFound Then MissingProjectDuration = MissingProjectDuration + 1
+
+        Dim EffectiveFitted As String
+        EffectiveFitted = GetExternalFitted(TestParams, ID, CStr(Tasks(4, r)))
+
+        If ScheduleTask(wsP, Families, FittedDates, TuningTimes, _
+            CStr(Tasks(2, r)), CStr(Tasks(3, r)), EffectiveFitted, _
+            TaskReq, CLng(Tasks(9, r)), Duration, MinStart, IsMU, PlannedEnd) Then
+
+            Planned = Planned + 1
+            If Not IsMU Then
+                If SUFinish.Exists(ID) Then
+                    If PlannedEnd > CLng(SUFinish(ID)) Then SUFinish(ID) = PlannedEnd
+                Else
+                    SUFinish.Add ID, PlannedEnd
+                End If
+            End If
+        Else
+            Skipped = Skipped + 1
+        End If
+NextTask:
+    Next r
+
+    FormatMacroPlanning wsP
+    MsgBox "Planning V8 généré." & vbCrLf & _
+           "Tests planifiés : " & Planned & vbCrLf & _
+           "Tests non planifiés : " & Skipped & vbCrLf & _
+           "ID vides : " & MissingID & vbCrLf & _
+           "Durées projet absentes : " & MissingProjectDuration, vbInformation
+
+CleanExit:
+    Application.StatusBar = False
+    Application.Calculation = OldCalc
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+FatalError:
+    MsgBox "Erreur V8 :" & vbCrLf & Err.Number & " - " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+' ============================================================================
+' DONNEES EXTERNES : PARAMETRES DES ESSAIS ET DUREES PAR PROJET
+' Liste Essais : paramètres généraux, Carry Over H, Fitted I.
+' Carry Over : ligne test x colonne projet = durée.
+' ============================================================================
+' Ouvre la base externe des essais en lecture seule.
+' Deux dictionnaires sont alimentés : les paramètres généraux de chaque essai
+' et les durées propres à chaque couple essai/projet. Si le fichier ne peut pas
+' être lu, l'outil continue avec les valeurs locales et les durées par défaut.
+Private Sub LoadExternalProjectData(ByRef TestParams As Object, ByRef ProjectDurations As Object)
+    Set TestParams = CreateObject("Scripting.Dictionary")
+    Set ProjectDurations = CreateObject("Scripting.Dictionary")
+
+    If Dir(EXTERNAL_FILE) = "" Then
+        MsgBox "Fichier externe introuvable :" & vbCrLf & EXTERNAL_FILE & vbCrLf & _
+               "La durée par défaut sera utilisée.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim wb As Workbook, WasOpen As Boolean
+    On Error GoTo Failed
+    Set wb = GetOpenWorkbookByPathOrName(EXTERNAL_FILE)
+    If wb Is Nothing Then
+        Set wb = Workbooks.Open(EXTERNAL_FILE, ReadOnly:=True)
+    Else
+        WasOpen = True
+    End If
+
+    Dim wsL As Worksheet, wsC As Worksheet
+    Set wsL = GetWorksheetByLooseName(wb, TEST_LIST_EXT_SHEET)
+    Set wsC = GetWorksheetByLooseName(wb, CARRY_OVER_SHEET)
+    If wsL Is Nothing Then Err.Raise vbObjectError + 20, , "Feuille Liste Essais introuvable."
+    If wsC Is Nothing Then Err.Raise vbObjectError + 21, , "Feuille Carry Over introuvable."
+
+    LoadExternalGeneralParams wsL, TestParams
+    LoadProjectDurationMatrix wsC, ProjectDurations
+
+    If Not WasOpen Then wb.Close False
+    Exit Sub
+Failed:
+    On Error Resume Next
+    If Not wb Is Nothing And Not WasOpen Then wb.Close False
+    On Error GoTo 0
+    MsgBox "Lecture externe impossible : " & Err.Description & vbCrLf & _
+           "La durée par défaut sera utilisée.", vbExclamation
+End Sub
+
+' Charge les paramètres généraux de la feuille Liste Essais.
+' L'identifiant de l'essai sert de clé. Les informations de carry-over et de
+' fitted sont stockées ensemble afin d'être retrouvées rapidement par la suite.
+Private Sub LoadExternalGeneralParams(ByVal ws As Worksheet, ByVal D As Object)
+    Dim H As Long, IDCol As Long, LastRow As Long, r As Long
+    Dim ID As String, Data As Variant
+    H = FindExternalHeaderRow(ws)
+    IDCol = FindHeaderColContains(ws, H, "#TEST", "")
+    If IDCol = 0 Then IDCol = FindHeaderColContains(ws, H, "TEST", "")
+    If IDCol = 0 Then IDCol = 5
+    LastRow = ws.Cells(ws.Rows.Count, IDCol).End(xlUp).Row
+
+    For r = H + 1 To LastRow
+        ID = NormalizeID(ws.Cells(r, IDCol).Value)
+        If ID <> "" Then
+            Data = Array( _
+                Trim$(CStr(ws.Cells(r, EXT_CARRY_OVER_COL).Value)), _
+                Trim$(CStr(ws.Cells(r, EXT_FITTED_COL).Value)))
+            D(ID) = Data
+        End If
+    Next r
+End Sub
+
+' Transforme la matrice de durées en dictionnaire.
+' Chaque durée est repérée par une clé composée de l'identifiant de l'essai et
+' du nom normalisé du projet. Cela évite de reparcourir le fichier externe pour
+' chaque tâche planifiée.
+Private Sub LoadProjectDurationMatrix(ByVal ws As Worksheet, ByVal D As Object)
+    Dim HeaderRow As Long, IDCol As Long, LastRow As Long, LastCol As Long
+    Dim ProjectCols As Object, c As Long, r As Long
+    Dim ProjectName As String, ProjectKey As String, ID As String, CompositeKey As String
+
+    HeaderRow = FindProjectHeaderRow(ws)
+    IDCol = FindHeaderColContains(ws, HeaderRow, "#TEST", "")
+    If IDCol = 0 Then IDCol = FindHeaderColContains(ws, HeaderRow, "TEST", "")
+    If IDCol = 0 Then IDCol = 5
+
+    Set ProjectCols = CreateObject("Scripting.Dictionary")
+    LastCol = ws.Cells(HeaderRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = FIRST_PROJECT_COL To LastCol
+        ProjectName = Trim$(CStr(ws.Cells(HeaderRow, c).Value))
+        ProjectKey = NormalizeKey(ProjectName)
+        If ProjectKey <> "" Then ProjectCols(ProjectKey) = c
+    Next c
+
+    LastRow = ws.Cells(ws.Rows.Count, IDCol).End(xlUp).Row
+    Dim P As Variant, V As Variant, Duration As Long
+    For r = HeaderRow + 1 To LastRow
+        ID = NormalizeID(ws.Cells(r, IDCol).Value)
+        If ID <> "" Then
+            For Each P In ProjectCols.Keys
+                V = ws.Cells(r, CLng(ProjectCols(P))).Value
+                If IsSafeNumeric(V) Then
+                    Duration = SafeLong(V)
+                    If Duration > 0 Then
+                        CompositeKey = ID & "|" & CStr(P)
+                        D(CompositeKey) = Duration
+                    End If
+                End If
+            Next P
+        End If
+    Next r
+End Sub
+
+' Retourne la durée prévue pour un essai sur un projet donné.
+' Si aucune correspondance n'existe, une durée d'une semaine est utilisée et le
+' paramètre Found reste à False pour signaler l'absence dans le bilan final.
+Private Function GetProjectDuration(ByVal D As Object, ByVal TestID As String, _
+    ByVal ProjectName As String, ByRef Found As Boolean) As Long
+
+    Dim K As String
+    K = NormalizeID(TestID) & "|" & NormalizeKey(ProjectName)
+    Found = False
+
+    If NormalizeKey(ProjectName) <> "" And D.Exists(K) Then
+        GetProjectDuration = CLng(D(K))
+        Found = True
+    Else
+        GetProjectDuration = DEFAULT_TEST_DURATION
+    End If
+
+    If GetProjectDuration <= 0 Then GetProjectDuration = DEFAULT_TEST_DURATION
+End Function
+
+' Recherche la contrainte fitted dans la base externe.
+' La valeur externe est prioritaire. Si elle est vide ou absente, la valeur
+' renseignée directement dans le fichier de planification est conservée.
+Private Function GetExternalFitted(ByVal D As Object, ByVal TestID As String, _
+    ByVal LocalDefault As String) As String
+    Dim K As String, Data As Variant
+    K = NormalizeID(TestID)
+    If D.Exists(K) Then
+        Data = D(K)
+        If Trim$(CStr(Data(1))) <> "" Then
+            GetExternalFitted = Trim$(CStr(Data(1)))
+            Exit Function
+        End If
+    End If
+    GetExternalFitted = LocalDefault
+End Function
+
+' Recherche la ligne contenant les noms des projets dans Carry Over.
+' Les dix premières lignes sont analysées et la première possédant au moins un
+' projet à partir de la colonne H est utilisée comme ligne d'en-tête.
+Private Function FindProjectHeaderRow(ByVal ws As Worksheet) As Long
+    Dim r As Long, c As Long, LastCol As Long, NonEmptyProjects As Long
+    For r = 1 To 10
+        LastCol = ws.Cells(r, ws.Columns.Count).End(xlToLeft).Column
+        NonEmptyProjects = 0
+        For c = FIRST_PROJECT_COL To LastCol
+            If Trim$(CStr(ws.Cells(r, c).Value)) <> "" Then NonEmptyProjects = NonEmptyProjects + 1
+        Next c
+        If NonEmptyProjects > 0 Then
+            FindProjectHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    FindProjectHeaderRow = 1
+End Function
+
+' Recherche la ligne d'en-tête de la liste externe des essais.
+' La détection repose sur la présence d'une colonne contenant le mot TEST.
+Private Function FindExternalHeaderRow(ByVal ws As Worksheet) As Long
+    Dim r As Long
+    For r = 1 To 10
+        If FindHeaderColContains(ws, r, "TEST", "") > 0 Then
+            FindExternalHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    FindExternalHeaderRow = 1
+End Function
+
+' ============================================================================
+' ORDONNANCEMENT ET SELECTION DES TRAINS
+' ============================================================================
+' Recherche la meilleure date et le meilleur groupe de trains pour un essai.
+' La première période réalisable est trouvée en priorité. Les quelques semaines
+' suivantes sont ensuite comparées afin d'équilibrer la charge ou d'éviter un
+' transport, tout en pénalisant fortement tout décalage de l'essai.
+Private Function ScheduleTask(ByVal wsP As Worksheet, ByVal Families As Object, _
+    ByVal FittedDates As Object, ByVal TuningTimes As Object, _
+    ByVal TestName As String, ByVal CostingCode As String, ByVal Fitted As String, _
+    ByVal Requirements As Object, ByVal ColorCode As Long, ByVal Duration As Long, _
+    ByVal MinimumStart As Long, ByVal IsMU As Boolean, ByRef PlannedEnd As Long) As Boolean
+
+    Dim RequiredCount As Long, LastStart As Long, ColTry As Long, FirstCol As Long
+    Dim Selected As Collection, FirstTrains As Collection, SelectionScore As Double
+    Dim FirstScore As Double, RequireFitted As Boolean
+
+    RequiredCount = CountRequiredTrains(Requirements)
+    RequireFitted = IsYesMarker(Fitted)
+    LastStart = GetPlanningLastWeekCol(wsP) - Duration + 1
+    If MinimumStart < START_WEEK_COL Then MinimumStart = START_WEEK_COL
+
+    For ColTry = MinimumStart To LastStart
+        Set Selected = SelectAvailableTrains(wsP, Families, FittedDates, TuningTimes, _
+            Requirements, ColTry, CostingCode, Duration, RequireFitted, IsMU, SelectionScore)
+        If Selected.Count = RequiredCount Then
+            FirstCol = ColTry
+            FirstScore = SelectionScore
+            Set FirstTrains = Selected
+            Exit For
+        End If
+    Next ColTry
+    If FirstCol = 0 Then Exit Function
+
+    Dim BestCol As Long, BestScore As Double, SearchEnd As Long
+    Dim CandidateScore As Double, BestTrains As Collection
+    BestCol = FirstCol: BestScore = FirstScore: Set BestTrains = FirstTrains
+    SearchEnd = FirstCol + MAX_OPTIMIZATION_DELAY
+    If SearchEnd > LastStart Then SearchEnd = LastStart
+
+    For ColTry = FirstCol + 1 To SearchEnd
+        Set Selected = SelectAvailableTrains(wsP, Families, FittedDates, TuningTimes, _
+            Requirements, ColTry, CostingCode, Duration, RequireFitted, IsMU, SelectionScore)
+        If Selected.Count = RequiredCount Then
+            CandidateScore = SelectionScore + (ColTry - FirstCol) * WEEK_DELAY_PENALTY
+            If CandidateScore < BestScore Then
+                BestCol = ColTry: BestScore = CandidateScore: Set BestTrains = Selected
+            End If
+        End If
+    Next ColTry
+
+    Dim T As Variant
+    For Each T In BestTrains
+        WriteTestOnTrain wsP, TuningTimes, CStr(T), TestName, CostingCode, BestCol, ColorCode, Duration
+    Next T
+    PlannedEnd = BestCol + Duration - 1
+    ScheduleTask = True
+End Function
+
+' Sélectionne le nombre de trains exigé pour chaque famille.
+' Pour une configuration MU, plusieurs trains peuvent être retenus en même temps.
+' Un train déjà sélectionné dans le groupe ne peut pas être choisi une seconde fois.
+Private Function SelectAvailableTrains(ByVal wsP As Worksheet, ByVal Families As Object, _
+    ByVal FittedDates As Object, ByVal TuningTimes As Object, ByVal Requirements As Object, _
+    ByVal WeekCol As Long, ByVal CostingCode As String, ByVal Duration As Long, _
+    ByVal RequireFitted As Boolean, ByVal IsMU As Boolean, ByRef TotalScore As Double) As Collection
+
+    Dim Result As New Collection, FamilyName As Variant, Qty As Long, i As Long
+    Dim BestTrain As String, TrainScore As Double
+    TotalScore = 0
+    For Each FamilyName In Requirements.Keys
+        Qty = CLng(Requirements(FamilyName))
+        For i = 1 To Qty
+            BestTrain = GetBestTrain(wsP, Families, FittedDates, TuningTimes, CStr(FamilyName), _
+                WeekCol, Result, CostingCode, Duration, RequireFitted, IsMU, TrainScore)
+            If BestTrain = "" Then Set SelectAvailableTrains = New Collection: Exit Function
+            Result.Add BestTrain
+            TotalScore = TotalScore + TrainScore
+        Next i
+    Next FamilyName
+    Set SelectAvailableTrains = Result
+End Function
+
+' Compare les trains compatibles et conserve celui ayant le meilleur score.
+' Avant le calcul du score, la fonction vérifie la famille, le fitted, la
+' disponibilité, le transport et le tuning. Le score pénalise ensuite la charge,
+' les semaines consécutives, les préparations et les changements de site.
+Private Function GetBestTrain(ByVal wsP As Worksheet, ByVal Families As Object, _
+    ByVal FittedDates As Object, ByVal TuningTimes As Object, ByVal NeededFamily As String, _
+    ByVal WeekCol As Long, ByVal AlreadySelected As Collection, ByVal CostingCode As String, _
+    ByVal Duration As Long, ByVal RequireFitted As Boolean, ByVal IsMU As Boolean, _
+    ByRef BestScoreOut As Double) As String
+
+    Dim T As Variant, BestScore As Double, Site As String
+    BestScore = 1E+30: Site = GetPlaceFromCosting(CostingCode)
+
+    For Each T In Families.Keys
+        If IsFamilyCompatible(CStr(Families(T)), NeededFamily) Then
+            If Not CollectionContains(AlreadySelected, CStr(T)) Then
+                If IsTrainFitted(wsP, FittedDates, CStr(T), WeekCol, RequireFitted) Then
+                    Dim rp As Long, rl As Long, rt As Long
+                    If GetTrainRows(wsP, CStr(T), rp, rl, rt) Then
+                        If CanAcceptSetups(wsP, TuningTimes, rp, rt, WeekCol, CostingCode, Duration) Then
+                            Dim Score As Double, SW As Long, DW As Long
+                            Score = GetTrainLoad(wsP, rt) * TOTAL_LOAD_WEIGHT
+                            Score = Score + GetLocalLoad(wsP, rt, WeekCol) * LOCAL_LOAD_WEIGHT
+                            Score = Score + GetConsecutiveLoad(wsP, rt, WeekCol) * CONSECUTIVE_LOAD_WEIGHT
+                            If Not HasVisitedPlace(wsP, rp, WeekCol, Site) Then
+                                GetTuningDurations TuningTimes, Site, SW, DW
+                                Score = Score + (SW + DW) * 50
+                            End If
+                            If NeedTransport(wsP, rp, WeekCol - SW - DW, Site) Then Score = Score + TRANSPORT_PENALTY
+                            If Score < BestScore Then BestScore = Score: GetBestTrain = CStr(T)
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next T
+    BestScoreOut = BestScore
+End Function
+
+' ============================================================================
+' CONTROLE ET ECRITURE DU TRANSPORT, DU TUNING ET DES ESSAIS
+' ============================================================================
+' Vérifie que toute la séquence précédant l'essai peut être réservée.
+' La période contrôlée peut comprendre un transport, un tuning statique, un
+' tuning dynamique et enfin l'essai. Aucun de ces éléments ne doit chevaucher
+' une activité déjà présente sur le train ou une préparation déjà prise au site.
+Private Function CanAcceptSetups(ByVal wsP As Worksheet, ByVal TuningTimes As Object, _
+    ByVal rp As Long, ByVal rt As Long, ByVal WeekCol As Long, _
+    ByVal CostingCode As String, ByVal Duration As Long) As Boolean
+
+    Dim Site As String, SW As Long, DW As Long, SetupStart As Long, TransportWeeks As Long
+    Site = GetPlaceFromCosting(CostingCode)
+    If Not IsTrainFree(wsP, rt, WeekCol, Duration) Then Exit Function
+    If Not HasVisitedPlace(wsP, rp, WeekCol, Site) Then GetTuningDurations TuningTimes, Site, SW, DW
+    If NeedTransport(wsP, rp, WeekCol - SW - DW, Site) Then TransportWeeks = TRANSPORT_DURATION
+    SetupStart = WeekCol - SW - DW - TransportWeeks
+    If SetupStart < START_WEEK_COL Then Exit Function
+    If SW + DW + TransportWeeks > 0 Then
+        If Not IsTrainFree(wsP, rt, SetupStart, SW + DW + TransportWeeks) Then Exit Function
+    End If
+    If SW + DW > 0 Then
+        If Not IsSiteTuningWindowAvailable(wsP, Site, WeekCol - SW - DW, SW, DW) Then Exit Function
+    End If
+    CanAcceptSetups = True
+End Function
+
+' Ecrit dans le planning la séquence retenue pour un train.
+' Les trois lignes du train indiquent le site, le laboratoire et l'activité.
+' Le transport et les tunings sont ajoutés avant l'essai lorsqu'ils sont requis.
+Private Sub WriteTestOnTrain(ByVal wsP As Worksheet, ByVal TuningTimes As Object, _
+    ByVal TrainName As String, ByVal TestName As String, ByVal CostingCode As String, _
+    ByVal WeekCol As Long, ByVal ColorCode As Long, ByVal Duration As Long)
+
+    Dim rp As Long, rl As Long, rt As Long
+    If Not GetTrainRows(wsP, TrainName, rp, rl, rt) Then Exit Sub
+    Dim Site As String, Labo As String, SW As Long, DW As Long, SetupCol As Long, c As Long
+    Site = GetPlaceFromCosting(CostingCode): Labo = GetLaboFromCosting(CostingCode)
+    If Not HasVisitedPlace(wsP, rp, WeekCol, Site) Then GetTuningDurations TuningTimes, Site, SW, DW
+    SetupCol = WeekCol - SW - DW
+
+    If NeedTransport(wsP, rp, SetupCol, Site) Then
+        c = SetupCol - TRANSPORT_DURATION
+        wsP.Cells(rp, c).Value = GetLastPlace(wsP, rp, SetupCol) & " -> " & Site
+        wsP.Cells(rl, c).Value = "": wsP.Cells(rt, c).Value = "TRANSPORT"
+        FormatBlock wsP, rp, rt, c, RGB(217, 217, 217)
+    End If
+    For c = 0 To SW - 1
+        WriteSetup wsP, rp, rl, rt, SetupCol + c, Site, STATIC_TUNING, RGB(255, 230, 153)
+    Next c
+    For c = 0 To DW - 1
+        WriteSetup wsP, rp, rl, rt, SetupCol + SW + c, Site, DYNAMIC_TUNING, RGB(189, 215, 238)
+    Next c
+    For c = WeekCol To WeekCol + Duration - 1
+        wsP.Cells(rp, c).Value = Site: wsP.Cells(rl, c).Value = Labo: wsP.Cells(rt, c).Value = TestName
+        FormatBlock wsP, rp, rt, c, ColorCode
+    Next c
+End Sub
+
+' Charge les durées de tuning statique et dynamique par site.
+' Les colonnes A, B et C de la feuille Tuning Time contiennent respectivement
+' le site, la durée statique et la durée dynamique.
+Private Function LoadTuningTimes() As Object
+    Dim D As Object, ws As Worksheet, r As Long, LastRow As Long, Site As String, Data As Variant
+    Set D = CreateObject("Scripting.Dictionary")
+    On Error Resume Next: Set ws = ThisWorkbook.Worksheets(TUNING_SHEET): On Error GoTo 0
+    If ws Is Nothing Then Set LoadTuningTimes = D: Exit Function
+    LastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    For r = 1 To LastRow
+        Site = Trim$(CStr(ws.Cells(r, "A").Value))
+        If Site <> "" And (IsSafeNumeric(ws.Cells(r, "B").Value) Or IsSafeNumeric(ws.Cells(r, "C").Value)) Then
+            Data = Array(SafeLong(ws.Cells(r, "B").Value), SafeLong(ws.Cells(r, "C").Value))
+            D(NormalizeKey(Site)) = Data
+        End If
+    Next r
+    Set LoadTuningTimes = D
+End Function
+
+' Retourne les durées de tuning du site demandé.
+' Si le site n'est pas présent dans le dictionnaire, les deux durées restent nulles.
+Private Sub GetTuningDurations(ByVal D As Object, ByVal Site As String, ByRef SW As Long, ByRef DW As Long)
+    Dim Data As Variant: SW = 0: DW = 0
+    If D.Exists(NormalizeKey(Site)) Then
+        Data = D(NormalizeKey(Site)): SW = SafeLong(Data(0)): DW = SafeLong(Data(1))
+    End If
+End Sub
+
+' Vérifie que le site est libre pendant toute la préparation.
+' Une seule opération de tuning peut être programmée sur le site pour une même semaine.
+Private Function IsSiteTuningWindowAvailable(ByVal ws As Worksheet, ByVal Site As String, _
+    ByVal StartCol As Long, ByVal SW As Long, ByVal DW As Long) As Boolean
+    Dim c As Long
+    For c = StartCol To StartCol + SW + DW - 1
+        If IsSiteTuningBusy(ws, Site, c) Then Exit Function
+    Next c
+    IsSiteTuningWindowAvailable = True
+End Function
+
+' Recherche dans le planning si un tuning est déjà prévu sur le site.
+' La fonction parcourt les lignes Tests et compare le site situé deux lignes au-dessus.
+Private Function IsSiteTuningBusy(ByVal ws As Worksheet, ByVal Site As String, ByVal Col As Long) As Boolean
+    Dim r As Long, LastRow As Long, Activity As String
+    LastRow = ws.Cells(ws.Rows.Count, 5).End(xlUp).Row
+    For r = 1 To LastRow
+        If NormalizeKey(CStr(ws.Cells(r, 5).Value)) = "TESTS" Then
+            Activity = NormalizeKey(CStr(ws.Cells(r, Col).Value))
+            If NormalizeKey(CStr(ws.Cells(r - 2, Col).Value)) = NormalizeKey(Site) Then
+                If Activity = NormalizeKey(STATIC_TUNING) Or Activity = NormalizeKey(DYNAMIC_TUNING) Then
+                    IsSiteTuningBusy = True: Exit Function
+                End If
+            End If
+        End If
+    Next r
+End Function
+
+' Vérifie si le train a déjà été utilisé sur le site avant la date étudiée.
+' Dans la logique actuelle, un tuning n'est ajouté que lors de la première visite.
+Private Function HasVisitedPlace(ByVal ws As Worksheet, ByVal rp As Long, ByVal BeforeCol As Long, ByVal Site As String) As Boolean
+    Dim c As Long, V As String
+    For c = START_WEEK_COL To BeforeCol - 1
+        V = Trim$(CStr(ws.Cells(rp, c).Value))
+        If InStr(1, V, "->") > 0 Then V = Trim$(Split(V, "->")(1))
+        If V <> "" And NormalizeKey(V) = NormalizeKey(Site) Then HasVisitedPlace = True: Exit Function
+    Next c
+End Function
+
+' Détermine si un transport doit être ajouté avant le nouvel essai.
+' Le transport est nécessaire lorsque le dernier site connu diffère du site demandé.
+Private Function NeedTransport(ByVal ws As Worksheet, ByVal rp As Long, ByVal Col As Long, ByVal Site As String) As Boolean
+    Dim OldSite As String: OldSite = GetLastPlace(ws, rp, Col)
+    If OldSite <> "" And Site <> "" Then NeedTransport = (NormalizeKey(OldSite) <> NormalizeKey(Site))
+End Function
+
+' Recherche le dernier site connu du train en remontant le planning.
+' Lorsqu'une cellule contient un trajet, seule la destination située après la flèche est retenue.
+Private Function GetLastPlace(ByVal ws As Worksheet, ByVal rp As Long, ByVal Col As Long) As String
+    Dim c As Long, V As String
+    For c = Col - 1 To START_WEEK_COL Step -1
+        V = Trim$(CStr(ws.Cells(rp, c).Value))
+        If V <> "" Then
+            If InStr(1, V, "->") > 0 Then V = Trim$(Split(V, "->")(1))
+            GetLastPlace = V: Exit Function
+        End If
+    Next c
+End Function
+
+' Ecrit une semaine de tuning dans les trois lignes du train.
+' La mise en forme est ensuite appliquée de manière identique sur tout le bloc.
+Private Sub WriteSetup(ByVal ws As Worksheet, ByVal rp As Long, ByVal rl As Long, ByVal rt As Long, _
+    ByVal Col As Long, ByVal Site As String, ByVal Label As String, ByVal FillColor As Long)
+    ws.Cells(rp, Col).Value = Site: ws.Cells(rl, Col).Value = "": ws.Cells(rt, Col).Value = Label
+    FormatBlock ws, rp, rt, Col, FillColor
+End Sub
+
+' Applique la couleur, les bordures et l'alignement à un bloc du planning.
+' Cette procédure garantit une présentation homogène pour les essais et les préparations.
+Private Sub FormatBlock(ByVal ws As Worksheet, ByVal rp As Long, ByVal rt As Long, _
+    ByVal Col As Long, ByVal FillColor As Long)
+    With ws.Range(ws.Cells(rp, Col), ws.Cells(rt, Col))
+        .Interior.Color = FillColor: .Borders.LineStyle = xlContinuous
+        .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter: .WrapText = True
+    End With
+End Sub
+
+' ============================================================================
+' GESTION DES CONFIGURATIONS SINGLE UNIT ET MULTIPLE UNIT
+' ============================================================================
+' Détermine si une configuration est de type Multiple Unit.
+' Les marqueurs MU et SU sont recherchés dans son nom. En l'absence de marqueur,
+' le besoin de plusieurs trains est utilisé comme règle de secours.
+Private Function IsMUConfiguration(ByVal ConfigName As String, ByVal Requirements As Object) As Boolean
+    Dim K As String: K = NormalizeKey(ConfigName)
+    If InStr(1, K, "MU") > 0 Then IsMUConfiguration = True: Exit Function
+    If InStr(1, K, "SU") > 0 Then Exit Function
+    IsMUConfiguration = (CountRequiredTrains(Requirements) > 1)
+End Function
+
+' Construit la liste des essais possédant une phase Single Unit.
+' Cette liste permet ensuite d'empêcher leur phase MU de commencer avant la fin de la SU.
+Private Function BuildIDsWithSU(ByRef T, ByVal N As Long) As Object
+    Dim D As Object, i As Long, r As Object, ID As String
+    Set D = CreateObject("Scripting.Dictionary")
+    For i = 1 To N
+        Set r = T(7, i)
+        If Not IsMUConfiguration(CStr(T(6, i)), r) Then
+            ID = NormalizeID(T(10, i)): If ID <> "" Then D(ID) = True
+        End If
+    Next i
+    Set BuildIDsWithSU = D
+End Function
+
+' Définit l'ordre entre deux tâches avant la planification.
+' Pour un même essai, la phase SU passe toujours avant la MU. Dans les autres cas,
+' la valeur de priorité la plus élevée est traitée en premier.
+Private Function TaskComesBefore(ByRef T, ByVal Candidate As Long, ByVal Current As Long) As Boolean
+    Dim R1 As Object, R2 As Object, MU1 As Boolean, MU2 As Boolean
+    Set R1 = T(7, Candidate): Set R2 = T(7, Current)
+    MU1 = IsMUConfiguration(CStr(T(6, Candidate)), R1)
+    MU2 = IsMUConfiguration(CStr(T(6, Current)), R2)
+    If NormalizeID(T(10, Candidate)) = NormalizeID(T(10, Current)) And MU1 <> MU2 Then
+        TaskComesBefore = (Not MU1 And MU2)
+    Else
+        TaskComesBefore = (CLng(Val(T(1, Candidate))) > CLng(Val(T(1, Current))))
+    End If
+End Function
+
+' Trie le tableau des tâches selon les règles définies ci-dessus.
+' L'élément 7 étant un dictionnaire, son échange exige l'instruction Set.
+Private Sub SortTasks(ByRef T, ByVal N As Long)
+    Dim i As Long, j As Long, K As Long, Tmp As Variant, TmpObj As Object
+    For i = 1 To N - 1
+        For j = i + 1 To N
+            If TaskComesBefore(T, j, i) Then
+                For K = 1 To 11
+                    If K = 7 Then
+                        Set TmpObj = T(K, i): Set T(K, i) = T(K, j): Set T(K, j) = TmpObj
+                    Else
+                        Tmp = T(K, i): T(K, i) = T(K, j): T(K, j) = Tmp
+                    End If
+                Next K
+            End If
+        Next j
+    Next i
+End Sub
+
+' ============================================================================
+' CONTROLE DU FITTED, DES FAMILLES ET DE LA DISPONIBILITE
+' ============================================================================
+' Charge la date de fitted de chaque train depuis Revision followup.
+' Le nom normalisé du train sert de clé dans le dictionnaire.
+Private Function LoadTrainFittedDates() As Object
+    Dim D As Object, ws As Worksheet, r As Long, Dt As Date, Name As String
+    Set D = CreateObject("Scripting.Dictionary"): Set ws = ThisWorkbook.Worksheets(FOLLOWUP_SHEET)
+    For r = 9 To ws.Cells(ws.Rows.Count, "E").End(xlUp).Row
+        Name = Trim$(CStr(ws.Cells(r, "E").Value)): Dt = ParseDateFR(ws.Cells(r, "F").Value)
+        If Name <> "" And Dt <> 0 Then D(NormalizeKey(Name)) = Dt
+    Next r
+    Set LoadTrainFittedDates = D
+End Function
+
+' Vérifie si le train a atteint le niveau de finition requis.
+' Si l'essai ne demande pas un train fitted, le contrôle est validé immédiatement.
+' Sinon, la semaine étudiée doit être postérieure ou égale à la date fitted du train.
+Private Function IsTrainFitted(ByVal ws As Worksheet, ByVal D As Object, ByVal TrainName As String, _
+    ByVal WeekCol As Long, ByVal Required As Boolean) As Boolean
+    If Not Required Then IsTrainFitted = True: Exit Function
+    Dim Dt As Date, Found As Boolean, K As Variant
+    If D.Exists(NormalizeKey(TrainName)) Then Dt = D(NormalizeKey(TrainName)): Found = True
+    If Not Found Then
+        For Each K In D.Keys
+            If InStr(1, CStr(K), NormalizeKey(TrainName)) > 0 Or InStr(1, NormalizeKey(TrainName), CStr(K)) > 0 Then
+                Dt = D(K): Found = True: Exit For
+            End If
+        Next K
+    End If
+    If Found Then IsTrainFitted = (WeekCol >= GetColumnFromDate(ws, Dt))
+End Function
+
+' Charge l'association entre chaque train et sa famille.
+' Les données proviennent du tableau structuré Famille_Train.
+Private Function LoadTrainFamilies() As Object
+    Dim D As Object, lo As ListObject, ct As Long, cf As Long, lr As ListRow
+    Set D = CreateObject("Scripting.Dictionary"): Set lo = GetTableByName("Famille_Train")
+    If lo Is Nothing Then Set LoadTrainFamilies = D: Exit Function
+    ct = GetTableColumnIndex(lo, "TRAIN"): cf = GetTableColumnIndex(lo, "FAMILLE")
+    For Each lr In lo.ListRows
+        If Trim$(CStr(lr.Range.Cells(1, ct).Value)) <> "" Then _
+            D(Trim$(CStr(lr.Range.Cells(1, ct).Value))) = Trim$(CStr(lr.Range.Cells(1, cf).Value))
+    Next lr
+    Set LoadTrainFamilies = D
+End Function
+
+' Charge les besoins en trains pour chaque configuration.
+' Pour chaque ligne de Config_Train, un dictionnaire indique les familles nécessaires
+' et la quantité attendue. Cette structure permet de gérer SU comme MU.
+Private Function LoadConfigRequirements() As Object
+    Dim D As Object, lo As ListObject, cc As Long, lr As ListRow, r As Object
+    Dim c As Long, Name As String, Qty As Long, Key As String
+    Set D = CreateObject("Scripting.Dictionary"): Set lo = GetTableByName("Config_Train")
+    If lo Is Nothing Then Set LoadConfigRequirements = D: Exit Function
+    cc = GetTableColumnIndex(lo, "CONFIG")
+    For Each lr In lo.ListRows
+        Key = NormalizeKey(CStr(lr.Range.Cells(1, cc).Value))
+        If Key <> "" Then
+            Set r = CreateObject("Scripting.Dictionary")
+            For c = 1 To lo.ListColumns.Count
+                If c <> cc Then
+                    Name = lo.ListColumns(c).Name: Qty = SafeLong(lr.Range.Cells(1, c).Value)
+                    If Qty > 0 Then r(Name) = Qty
+                End If
+            Next c
+            If D.Exists(Key) Then Set D(Key) = r Else D.Add Key, r
+        End If
+    Next lr
+    Set LoadConfigRequirements = D
+End Function
+
+' Repère les colonnes de test list correspondant aux configurations connues.
+' Les noms sont normalisés afin de tolérer les différences d'espaces ou de ponctuation.
+Private Function BuildConfigColumns(ByVal ws As Worksheet, ByVal Req As Object) As Object
+    Dim D As Object, c As Long, K As String
+    Set D = CreateObject("Scripting.Dictionary")
+    For c = 1 To ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+        K = NormalizeKey(CStr(ws.Cells(1, c).Value)): If Req.Exists(K) Then D(K) = c
+    Next c
+    Set BuildConfigColumns = D
+End Function
+
+' Additionne les quantités demandées dans une configuration.
+' Le résultat indique combien de trains doivent être sélectionnés simultanément.
+Private Function CountRequiredTrains(ByVal r As Object) As Long
+    Dim K As Variant: For Each K In r.Keys: CountRequiredTrains = CountRequiredTrains + CLng(r(K)): Next K
+End Function
+
+' Vérifie qu'un train appartient à la famille demandée.
+' Une cellule peut contenir plusieurs familles séparées par /, +, ; ou une virgule.
+Private Function IsFamilyCompatible(ByVal TrainFamily As String, ByVal Needed As String) As Boolean
+    Dim P() As String, i As Long, S As String
+    S = Replace(Replace(Replace(TrainFamily, "/", "+"), ";", "+"), ",", "+"): P = Split(S, "+")
+    For i = LBound(P) To UBound(P)
+        If NormalizeKey(P(i)) = NormalizeKey(Needed) Then IsFamilyCompatible = True: Exit Function
+    Next i
+End Function
+
+' Vérifie que la ligne Tests du train est vide pendant toute la durée demandée.
+' La période doit également rester à l'intérieur des limites du planning.
+Private Function IsTrainFree(ByVal ws As Worksheet, ByVal rt As Long, ByVal FirstCol As Long, ByVal Duration As Long) As Boolean
+    Dim c As Long
+    If FirstCol < START_WEEK_COL Or FirstCol + Duration - 1 > GetPlanningLastWeekCol(ws) Then Exit Function
+    For c = FirstCol To FirstCol + Duration - 1
+        If Trim$(CStr(ws.Cells(rt, c).Value)) <> "" Then Exit Function
+    Next c
+    IsTrainFree = True
+End Function
+
+' Compte le nombre total de semaines déjà occupées sur le train.
+' Cette valeur participe à la répartition globale de la charge.
+Private Function GetTrainLoad(ByVal ws As Worksheet, ByVal rt As Long) As Long
+    Dim c As Long: For c = START_WEEK_COL To GetPlanningLastWeekCol(ws)
+        If Trim$(CStr(ws.Cells(rt, c).Value)) <> "" Then GetTrainLoad = GetTrainLoad + 1
+    Next c
+End Function
+
+' Mesure la charge autour de la semaine envisagée.
+' Cette valeur évite de concentrer trop d'essais sur un même train pendant une courte période.
+Private Function GetLocalLoad(ByVal ws As Worksheet, ByVal rt As Long, ByVal Center As Long) As Long
+    Dim c As Long, A As Long, B As Long
+    A = Center - LOCAL_WINDOW: If A < START_WEEK_COL Then A = START_WEEK_COL
+    B = Center + LOCAL_WINDOW: If B > GetPlanningLastWeekCol(ws) Then B = GetPlanningLastWeekCol(ws)
+    For c = A To B: If Trim$(CStr(ws.Cells(rt, c).Value)) <> "" Then GetLocalLoad = GetLocalLoad + 1
+    Next c
+End Function
+
+' Compte les semaines occupées sans interruption avant la date étudiée.
+' Une longue mobilisation continue augmente le score et rend le train moins prioritaire.
+Private Function GetConsecutiveLoad(ByVal ws As Worksheet, ByVal rt As Long, ByVal Col As Long) As Long
+    Dim c As Long: For c = Col - 1 To START_WEEK_COL Step -1
+        If Trim$(CStr(ws.Cells(rt, c).Value)) = "" Then Exit For
+        GetConsecutiveLoad = GetConsecutiveLoad + 1
+    Next c
+End Function
+
+' ============================================================================
+' CREATION DE LA STRUCTURE DU PLANNING ET DU COSTING
+' ============================================================================
+' Recrée entièrement la structure de la feuille Macro planning.
+' La procédure génère les semaines, ajoute un bloc Place/Labo/Tests pour chaque train
+' puis crée le tableau de costing en dessous du planning.
+Public Sub Planning_Style_Alstom_V8()
+    On Error GoTo Failed
+    Dim ws As Worksheet, wf As Worksheet, StartDate As Date, EndDate As Date
+    Set ws = ThisWorkbook.Worksheets("Macro planning"): Set wf = ThisWorkbook.Worksheets(FOLLOWUP_SHEET)
+    If Not IsDate(wf.Range("F2").Value) Or Not IsDate(wf.Range("G2").Value) Then Err.Raise 5, , "Dates F2/G2 invalides."
+    StartDate = CDate(wf.Range("F2").Value): EndDate = CDate(wf.Range("G2").Value)
+    StartDate = StartDate - Weekday(StartDate, vbMonday) + 1
+    On Error Resume Next: ws.ListObjects("tblCosting").Delete: On Error GoTo Failed
+    ws.Cells.UnMerge: ws.Cells.Clear: ws.Rows.Hidden = False: ws.Columns.Hidden = False
+
+    Dim c As Long, D As Date, LastCol As Long
+    c = START_WEEK_COL: D = StartDate
+    Do While D <= EndDate And c <= MAX_WEEK_COL
+        ws.Cells(5, c).Value = "W" & WorksheetFunction.WeekNum(D, 2) & "/" & Year(D)
+        ws.Cells(5, c).Orientation = 90: c = c + 1: D = D + 7
+    Loop
+    LastCol = c - 1
+    ws.Range("B2").Value = "ALSTOM": ws.Range("B2").Font.Bold = True: ws.Range("B8").Value = "Project Schedule"
+
+    Dim r As Long, RowDest As Long, Name As String
+    RowDest = 10
+    For r = 9 To wf.Cells(wf.Rows.Count, "E").End(xlUp).Row
+        Name = Trim$(CStr(wf.Cells(r, "E").Value))
+        If Name <> "" Then
+            ws.Cells(RowDest, 2).Value = Name: ws.Range(ws.Cells(RowDest, 2), ws.Cells(RowDest + 2, 2)).Merge
+            ws.Cells(RowDest, 5).Value = "Place": ws.Cells(RowDest + 1, 5).Value = "Labo": ws.Cells(RowDest + 2, 5).Value = "Tests"
+            ws.Range(ws.Cells(RowDest, 2), ws.Cells(RowDest + 2, LastCol)).Borders.LineStyle = xlContinuous
+            RowDest = RowDest + 4
+        End If
+    Next r
+    CreateCostingTable ws, RowDest + 4, LastCol
+    FormatMacroPlanning ws
+    Exit Sub
+Failed:
+    MsgBox "Erreur structure V8 : " & Err.Description, vbExclamation
+End Sub
+
+' Crée le tableau structuré utilisé pour le chiffrage hebdomadaire.
+' Les cinq premières colonnes décrivent le moyen, puis une colonne est créée par semaine.
+Private Sub CreateCostingTable(ByVal ws As Worksheet, ByVal H As Long, ByVal LastCol As Long)
+    Dim c As Long, Rng As Range, lo As ListObject
+    ws.Cells(H, 1).Value = "Lab": ws.Cells(H, 2).Value = "Ext/Int": ws.Cells(H, 3).Value = "Place"
+    ws.Cells(H, 4).Value = "Number of Weeks": ws.Cells(H, 5).Value = "men/w"
+    For c = START_WEEK_COL To LastCol: ws.Cells(H, c).Value = ws.Cells(5, c).Value: Next c
+    Set Rng = ws.Range(ws.Cells(H, 1), ws.Cells(H + 20, LastCol))
+    Set lo = ws.ListObjects.Add(xlSrcRange, Rng, , xlYes): lo.Name = "tblCosting": lo.TableStyle = "TableStyleMedium2"
+End Sub
+
+' Met à jour le chiffrage à partir des essais réellement planifiés.
+' Les transports et les tunings sont volontairement ignorés. Pour chaque essai, le code
+' de chiffrage permet de retrouver le laboratoire, le caractère interne/externe et le site.
+Public Sub UpdateCosting_V8()
+    Dim wsP As Worksheet, wsT As Worksheet, lo As ListObject
+    Set wsP = ThisWorkbook.Worksheets("Macro planning"): Set wsT = ThisWorkbook.Worksheets("test list")
+    On Error Resume Next: Set lo = wsP.ListObjects("tblCosting"): On Error GoTo 0
+    If lo Is Nothing Then Exit Sub
+    Dim lr As ListRow, c As Long
+    For Each lr In lo.ListRows: For c = START_WEEK_COL To lo.ListColumns.Count: lr.Range.Cells(1, c).Value = 0: Next c: Next lr
+
+    Dim r As Long, TestName As String, TestRow As Long, Code As String, P() As String
+    Dim CostRow As ListRow, tc As Long
+    For r = 1 To wsP.Cells(wsP.Rows.Count, 2).End(xlUp).Row
+        If NormalizeKey(CStr(wsP.Cells(r, 5).Value)) = "TESTS" Then
+            For c = START_WEEK_COL To GetPlanningLastWeekCol(wsP)
+                TestName = Trim$(CStr(wsP.Cells(r, c).Value))
+                If TestName <> "" And NormalizeKey(TestName) <> "TRANSPORT" And _
+                   NormalizeKey(TestName) <> NormalizeKey(STATIC_TUNING) And _
+                   NormalizeKey(TestName) <> NormalizeKey(DYNAMIC_TUNING) Then
+                    TestRow = FindTestRow(wsT, TestName)
+                    If TestRow > 0 Then
+                        Code = Trim$(CStr(wsT.Cells(TestRow, "P").Value)): P = Split(Code, "/")
+                        If UBound(P) >= 2 Then
+                            For Each CostRow In lo.ListRows
+                                If NormalizeKey(CStr(CostRow.Range.Cells(1, 1).Value)) = NormalizeKey(P(0)) And _
+                                   NormalizeKey(CStr(CostRow.Range.Cells(1, 2).Value)) = NormalizeKey(P(1)) And _
+                                   NormalizeKey(CStr(CostRow.Range.Cells(1, 3).Value)) = NormalizeKey(P(2)) Then
+                                    tc = GetCostingCol(lo, wsP.Cells(5, c).Value)
+                                    If tc > 0 Then CostRow.Range.Cells(1, tc).Value = SafeLong(CostRow.Range.Cells(1, tc).Value) + 1
+                                    Exit For
+                                End If
+                            Next CostRow
+                        End If
+                    End If
+                End If
+            Next c
+        End If
+    Next r
+End Sub
+
+' ============================================================================
+' FONCTIONS TECHNIQUES COMMUNES
+' ============================================================================
+' Retrouve les trois lignes Place, Labo et Tests associées à un train.
+' La fonction recherche d'abord le libellé Tests à proximité du nom du train.
+Private Function GetTrainRows(ByVal ws As Worksheet, ByVal Name As String, ByRef rp As Long, ByRef rl As Long, ByRef rt As Long) As Boolean
+    Dim Base As Long, r As Long, c As Long: Base = FindWagon(ws, Name): If Base = 0 Then Exit Function
+    For r = Base To Base + 6: For c = 1 To 6
+        If UCase$(Trim$(CStr(ws.Cells(r, c).Value))) = "TESTS" Then rt = r: rl = r - 1: rp = r - 2: GetTrainRows = True: Exit Function
+    Next c: Next r
+    rp = Base: rl = Base + 1: rt = Base + 2: GetTrainRows = True
+End Function
+
+' Recherche la ligne du train dans le planning.
+' Une correspondance exacte est tentée en premier, puis une recherche partielle sert de secours.
+Public Function FindWagon(ByVal ws As Worksheet, ByVal Name As String) As Long
+    Dim K As String, r As Long, V As String, LastRow As Long
+    K = NormalizeKey(Name): LastRow = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
+    For r = 1 To LastRow: V = NormalizeKey(CStr(ws.Cells(r, 2).Value)): If V = K Then FindWagon = r: Exit Function
+    Next r
+    For r = 1 To LastRow: V = NormalizeKey(CStr(ws.Cells(r, 2).Value))
+        If V <> "" And (InStr(1, V, K) > 0 Or InStr(1, K, V) > 0) Then FindWagon = r: Exit Function
+    Next r
+End Function
+
+' Efface les anciennes activités pour tous les trains connus.
+' La structure du planning est conservée, seuls les contenus et couleurs sont supprimés.
+Private Sub ClearMacroPlanning(ByVal ws As Worksheet, ByVal Families As Object)
+    Dim T As Variant, rp As Long, rl As Long, rt As Long
+    For Each T In Families.Keys
+        If GetTrainRows(ws, CStr(T), rp, rl, rt) Then
+            With ws.Range(ws.Cells(rp, START_WEEK_COL), ws.Cells(rt, GetPlanningLastWeekCol(ws)))
+                .ClearContents: .Interior.Pattern = xlNone
+            End With
+        End If
+    Next T
+End Sub
+
+' Retourne la dernière colonne de semaine disponible dans le planning.
+' Le résultat est limité entre la première semaine et la valeur MAX_WEEK_COL.
+Private Function GetPlanningLastWeekCol(ByVal ws As Worksheet) As Long
+    Dim c As Long: c = ws.Cells(5, ws.Columns.Count).End(xlToLeft).Column
+    If c < START_WEEK_COL Then c = START_WEEK_COL
+    If c > MAX_WEEK_COL Then c = MAX_WEEK_COL
+    GetPlanningLastWeekCol = c
+End Function
+
+' Applique une largeur uniforme aux colonnes de semaines.
+Private Sub FormatMacroPlanning(ByVal ws As Worksheet)
+    ws.Range(ws.Columns(START_WEEK_COL), ws.Columns(GetPlanningLastWeekCol(ws))).ColumnWidth = 12
+End Sub
+
+' Convertit une date en colonne du planning.
+' La date est ramenée au lundi de sa semaine puis comparée aux intitulés Wxx/année.
+Private Function GetColumnFromDate(ByVal ws As Worksheet, ByVal Dt As Date) As Long
+    Dim D As Date, W As Long, Y As Long, c As Long
+    D = Dt - Weekday(Dt, vbMonday) + 1: W = WorksheetFunction.WeekNum(D, 2): Y = Year(D)
+    For c = START_WEEK_COL To GetPlanningLastWeekCol(ws)
+        If CStr(ws.Cells(5, c).Value) = "W" & W & "/" & Y Then GetColumnFromDate = c: Exit Function
+    Next c
+End Function
+
+' Extrait le site depuis le code de chiffrage séparé par des barres obliques.
+' Si le site est absent, la valeur DEFAULT_PLACE est utilisée.
+Private Function GetPlaceFromCosting(ByVal Code As String) As String
+    Dim P() As String: If Trim$(Code) = "" Then GetPlaceFromCosting = DEFAULT_PLACE: Exit Function
+    P = Split(Code, "/"): If UBound(P) >= 2 And Trim$(P(2)) <> "" Then GetPlaceFromCosting = Trim$(P(2)) Else GetPlaceFromCosting = DEFAULT_PLACE
+End Function
+
+' Extrait le laboratoire depuis le code de chiffrage.
+' Si le laboratoire est absent, la valeur par défaut est retournée.
+Private Function GetLaboFromCosting(ByVal Code As String) As String
+    Dim P() As String: If Trim$(Code) = "" Then GetLaboFromCosting = DEFAULT_LABO: Exit Function
+    P = Split(Code, "/"): If UBound(P) >= 1 Then GetLaboFromCosting = Trim$(P(1)) Else GetLaboFromCosting = DEFAULT_LABO
+End Function
+
+' Recherche un tableau structuré dans toutes les feuilles du classeur.
+Private Function GetTableByName(ByVal Name As String) As ListObject
+    Dim ws As Worksheet, lo As ListObject
+    For Each ws In ThisWorkbook.Worksheets: For Each lo In ws.ListObjects
+        If NormalizeKey(lo.Name) = NormalizeKey(Name) Then Set GetTableByName = lo: Exit Function
+    Next lo: Next ws
+End Function
+
+' Recherche la position d'une colonne dans un tableau structuré.
+Private Function GetTableColumnIndex(ByVal lo As ListObject, ByVal Name As String) As Long
+    Dim c As Long: For c = 1 To lo.ListColumns.Count
+        If NormalizeKey(lo.ListColumns(c).Name) = NormalizeKey(Name) Then GetTableColumnIndex = c: Exit Function
+    Next c
+End Function
+
+' Vérifie si le fichier externe est déjà ouvert.
+' La comparaison est effectuée à la fois sur le chemin complet et sur le nom du fichier.
+Private Function GetOpenWorkbookByPathOrName(ByVal Path As String) As Workbook
+    Dim wb As Workbook, N As String: N = Dir(Path)
+    For Each wb In Application.Workbooks
+        If UCase$(wb.FullName) = UCase$(Path) Or UCase$(wb.Name) = UCase$(N) Then Set GetOpenWorkbookByPathOrName = wb: Exit Function
+    Next wb
+End Function
+
+' Recherche une feuille en comparant des noms normalisés.
+' Cela rend la lecture moins sensible aux espaces, accents et signes de ponctuation.
+Private Function GetWorksheetByLooseName(ByVal wb As Workbook, ByVal Name As String) As Worksheet
+    Dim ws As Worksheet: For Each ws In wb.Worksheets
+        If NormalizeKey(ws.Name) = NormalizeKey(Name) Then Set GetWorksheetByLooseName = ws: Exit Function
+    Next ws
+End Function
+
+' Recherche une colonne d'en-tête contenant un ou deux mots-clés.
+Private Function FindHeaderColContains(ByVal ws As Worksheet, ByVal Row As Long, ByVal A As String, ByVal B As String) As Long
+    Dim c As Long, H As String
+    For c = 1 To ws.Cells(Row, ws.Columns.Count).End(xlToLeft).Column
+        H = NormalizeHeader(CStr(ws.Cells(Row, c).Value))
+        If InStr(1, H, NormalizeHeader(A)) > 0 Then
+            If B = "" Or InStr(1, H, NormalizeHeader(B)) > 0 Then FindHeaderColContains = c: Exit Function
+        End If
+    Next c
+End Function
+
+' Vérifie qu'une collection ne contient pas déjà le train demandé.
+Private Function CollectionContains(ByVal c As Collection, ByVal Value As String) As Boolean
+    Dim V As Variant: For Each V In c
+        If NormalizeKey(CStr(V)) = NormalizeKey(Value) Then CollectionContains = True: Exit Function
+    Next V
+End Function
+
+' Convertit plusieurs façons d'écrire Oui en valeur booléenne.
+' Les valeurs Y, YES, OUI, TRUE, VRAI, 1 et X sont reconnues.
+Private Function IsYesMarker(ByVal V As Variant) As Boolean
+    Select Case NormalizeKey(CStr(V)): Case "Y", "YES", "OUI", "TRUE", "VRAI", "1", "X": IsYesMarker = True: End Select
+End Function
+
+' Vérifie qu'une cellule peut être convertie en nombre sans provoquer d'erreur.
+Private Function IsSafeNumeric(ByVal V As Variant) As Boolean
+    If IsError(V) Or IsEmpty(V) Then Exit Function
+    If Trim$(CStr(V)) = "" Then Exit Function
+    IsSafeNumeric = IsNumeric(V)
+End Function
+
+' Convertit une valeur en entier positif de type Long.
+' Les valeurs invalides ou négatives sont ramenées à zéro.
+Private Function SafeLong(ByVal V As Variant) As Long
+    If IsSafeNumeric(V) Then SafeLong = CLng(Val(CStr(V)))
+    If SafeLong < 0 Then SafeLong = 0
+End Function
+
+' Normalise un texte avant comparaison.
+' La fonction retire les accents, espaces et signes de ponctuation afin de rendre
+' les rapprochements plus tolérants aux différences de saisie.
+Private Function NormalizeKey(ByVal S As String) As String
+    S = UCase$(CStr(S)): S = Replace(S, "É", "E"): S = Replace(S, "È", "E"): S = Replace(S, "Ê", "E")
+    S = Replace(S, "À", "A"): S = Replace(S, "Â", "A"): S = Replace(S, "Ù", "U"): S = Replace(S, "Û", "U")
+    S = Replace(S, "Ô", "O"): S = Replace(S, "Î", "I"): S = Replace(S, "Ç", "C")
+    S = Replace(S, vbCr, ""): S = Replace(S, vbLf, ""): S = Replace(S, Chr$(160), "")
+    S = Replace(S, " ", ""): S = Replace(S, "_", ""): S = Replace(S, "-", "")
+    S = Replace(S, "/", ""): S = Replace(S, "+", ""): S = Replace(S, ":", ""): S = Replace(S, ".", "")
+    NormalizeKey = Trim$(S)
+End Function
+
+' Normalise un en-tête en retirant en plus les symboles # et ?.
+Private Function NormalizeHeader(ByVal S As String) As String
+    S = Replace(S, "#", ""): S = Replace(S, "?", ""): NormalizeHeader = NormalizeKey(S)
+End Function
+
+' Uniformise l'identifiant d'un essai en supprimant les espaces inutiles.
+Private Function NormalizeID(ByVal V As Variant) As String
+    Dim S As String: S = Trim$(CStr(V)): S = Replace(S, ",", "."): S = Replace(S, " ", ""): S = Replace(S, Chr$(160), "")
+    NormalizeID = UCase$(S)
+End Function
+
+' Convertit une date ou un libellé français de type mois-année en date VBA.
+' Les formes abrégées et complètes des mois sont acceptées.
+Private Function ParseDateFR(ByVal V As Variant) As Date
+    If IsDate(V) Then ParseDateFR = CDate(V): Exit Function
+    If IsError(V) Then Exit Function
+    Dim S As String, P() As String, M As Long, Y As Long
+    S = LCase$(Trim$(CStr(V))): S = Replace(S, "é", "e"): S = Replace(S, "è", "e"): S = Replace(S, "û", "u")
+    S = Replace(S, "ô", "o"): S = Replace(S, "à", "a"): S = Replace(S, " ", ""): S = Replace(S, ".", "")
+    P = Split(S, "-"): If UBound(P) <> 1 Then Exit Function
+    Select Case P(0)
+        Case "janv", "janvier": M = 1
+        Case "fev", "fevr", "fevrier": M = 2
+        Case "mars": M = 3
+        Case "avr", "avril": M = 4
+        Case "mai": M = 5
+        Case "juin": M = 6
+        Case "juil", "juillet": M = 7
+        Case "aout": M = 8
+        Case "sept", "septembre": M = 9
+        Case "oct", "octobre": M = 10
+        Case "nov", "novembre": M = 11
+        Case "dec", "decembre": M = 12
+    End Select
+    Y = CLng(Val(P(1))): If Y < 100 Then Y = 2000 + Y
+    If M > 0 And Y > 0 Then ParseDateFR = DateSerial(Y, M, 1)
+End Function
+
+' Recherche la ligne d'un essai dans test list à partir de son nom normalisé.
+Private Function FindTestRow(ByVal ws As Worksheet, ByVal Name As String) As Long
+    Dim r As Long: For r = 2 To ws.Cells(ws.Rows.Count, "G").End(xlUp).Row
+        If NormalizeKey(CStr(ws.Cells(r, "G").Value)) = NormalizeKey(Name) Then FindTestRow = r: Exit Function
+    Next r
+End Function
+
+' Recherche la colonne du tableau de costing correspondant à une semaine.
+Private Function GetCostingCol(ByVal lo As ListObject, ByVal Label As Variant) As Long
+    Dim c As Long: For c = 1 To lo.ListColumns.Count
+        If CStr(lo.HeaderRowRange.Cells(1, c).Value) = CStr(Label) Then GetCostingCol = c: Exit Function
+    Next c
+End Function
+
+
