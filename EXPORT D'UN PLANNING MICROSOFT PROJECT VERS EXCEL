@@ -1,0 +1,1250 @@
+Option Explicit
+
+'===============================================================================
+' ANNEXE 1 - EXPORT D'UN PLANNING MICROSOFT PROJECT VERS EXCEL
+'
+' Cette macro crée automatiquement un classeur Excel à partir du projet
+' Microsoft Project actuellement ouvert.
+'
+' Une feuille est générée pour chaque ressource. Elle contient :
+' - les tâches affectées à la ressource ;
+' - leurs dates de début et de fin ;
+' - leur pourcentage d'avancement ;
+' - le projet auquel elles appartiennent ;
+' - une représentation journalière sous forme de diagramme de Gantt ;
+' - les liens de dépendance entre les tâches.
+'
+' L'objectif est de rendre le planning accessible aux collaborateurs qui ne
+' disposent pas de Microsoft Project, tout en évitant qu'ils modifient
+' directement le planning principal.
+'===============================================================================
+
+
+'===============================================================================
+' FONCTIONS UTILITAIRES
+'
+' Ces fonctions réalisent des opérations simples utilisées plusieurs fois dans
+' la macro principale. Elles permettent de garder un code plus clair et
+' d'éviter de répéter les mêmes traitements.
+'===============================================================================
+
+
+Function ExtractID(ByVal inputText As String) As Long
+
+    ' Microsoft Project peut afficher un successeur sous plusieurs formes :
+    ' "125", "125FS", "125FS+3j", etc.
+    '
+    ' Pour retrouver la tâche correspondante dans Excel, seule la partie
+    ' numérique est nécessaire. Cette fonction récupère donc le premier
+    ' identifiant présent dans le texte.
+    '
+    ' Exemple :
+    ' "125FS+3j" devient 125.
+
+    Dim i As Long
+    Dim temp As String
+
+    temp = ""
+    inputText = Trim$(inputText)
+
+    ' Lecture du texte caractère par caractère.
+    For i = 1 To Len(inputText)
+
+        ' Tant que le caractère est un chiffre, il est ajouté à l'identifiant.
+        If Mid$(inputText, i, 1) Like "[0-9]" Then
+
+            temp = temp & Mid$(inputText, i, 1)
+
+        ' Dès qu'un autre caractère est rencontré après le début du numéro,
+        ' la lecture s'arrête.
+        ElseIf temp <> "" Then
+
+            Exit For
+
+        End If
+
+    Next i
+
+    ' Si aucun numéro n'a été trouvé, la fonction retourne 0.
+    If temp = "" Then
+        ExtractID = 0
+    Else
+        ExtractID = CLng(temp)
+    End If
+
+End Function
+
+
+Function SafeSheetName(ByVal s As String) As String
+
+    ' Le nom d'une ressource est utilisé pour nommer sa feuille Excel.
+    '
+    ' Excel interdit certains caractères dans les noms de feuilles et limite
+    ' leur longueur à 31 caractères. Cette fonction nettoie donc le nom avant
+    ' la création de la feuille pour éviter une erreur pendant l'export.
+
+    Dim badChars As Variant
+    Dim ch As Variant
+
+    badChars = Array("/", "\", "?", "*", "[", "]", ":", "'")
+
+    ' Remplacement des caractères interdits par des espaces.
+    For Each ch In badChars
+        s = Replace(s, ch, " ")
+    Next ch
+
+    s = Trim$(s)
+
+    ' Si le nom est vide après nettoyage, un nom générique est utilisé.
+    If Len(s) = 0 Then
+        s = "Ressource"
+    End If
+
+    ' Excel accepte au maximum 31 caractères dans le nom d'une feuille.
+    SafeSheetName = Left$(s, 31)
+
+End Function
+
+
+Function TaskHasResource(ByVal t As Task, ByVal res As Resource) As Boolean
+
+    ' Vérifie si une tâche est affectée à la ressource étudiée.
+    '
+    ' Une tâche Microsoft Project peut être affectée à plusieurs ressources.
+    ' La fonction parcourt donc toutes les affectations de la tâche et compare
+    ' leurs identifiants avec celui de la ressource recherchée.
+
+    On Error GoTo CleanFail
+
+    Dim asg As Assignment
+
+    TaskHasResource = False
+
+    ' Sécurité si la tâche ou la ressource n'existe pas.
+    If t Is Nothing Or res Is Nothing Then
+        Exit Function
+    End If
+
+    For Each asg In t.Assignments
+
+        If Not asg Is Nothing Then
+
+            If asg.ResourceID = res.ID Then
+                TaskHasResource = True
+                Exit Function
+            End If
+
+        End If
+
+    Next asg
+
+    Exit Function
+
+CleanFail:
+
+    ' Si une affectation ne peut pas être lue, la tâche est considérée
+    ' comme non affectée à cette ressource. Cela évite d'arrêter tout l'export.
+    TaskHasResource = False
+
+End Function
+
+
+Private Function CollectionContainsLong(ByVal col As Collection, _
+                                        ByVal v As Long) As Boolean
+
+    ' Vérifie si une valeur numérique est déjà présente dans une collection.
+    '
+    ' Cette fonction sert principalement à éviter d'enregistrer plusieurs fois
+    ' le début d'une même semaine ou d'un même mois lors de la construction
+    ' de la frise temporelle.
+
+    Dim it As Variant
+
+    CollectionContainsLong = False
+
+    For Each it In col
+
+        If CLng(it) = v Then
+            CollectionContainsLong = True
+            Exit Function
+        End If
+
+    Next it
+
+End Function
+
+
+Private Function DayLetterFR(ByVal d As Date) As String
+
+    ' Retourne l'initiale française du jour de la semaine.
+    '
+    ' Le résultat reprend le style de Microsoft Project :
+    ' L M M J V S D.
+    '
+    ' Le paramètre vbMonday indique que la semaine commence le lundi.
+
+    Select Case Weekday(d, vbMonday)
+
+        Case 1
+            DayLetterFR = "L"
+
+        Case 2
+            DayLetterFR = "M"
+
+        Case 3
+            DayLetterFR = "M"
+
+        Case 4
+            DayLetterFR = "J"
+
+        Case 5
+            DayLetterFR = "V"
+
+        Case 6
+            DayLetterFR = "S"
+
+        Case 7
+            DayLetterFR = "D"
+
+    End Select
+
+End Function
+
+
+Private Function SplitSuccessors(ByVal s As String) As Variant
+
+    ' Une tâche peut avoir plusieurs successeurs.
+    '
+    ' Selon les paramètres régionaux de Microsoft Project, les successeurs
+    ' peuvent être séparés par une virgule ou par un point-virgule.
+    ' La fonction transforme d'abord tous les séparateurs en virgules,
+    ' puis découpe la chaîne pour traiter chaque successeur séparément.
+
+    s = Trim$(s)
+
+    s = Replace(s, ";", ",")
+    s = Replace(s, " ,", ",")
+    s = Replace(s, ", ", ",")
+
+    SplitSuccessors = Split(s, ",")
+
+End Function
+
+
+'===============================================================================
+' MACRO PRINCIPALE
+'
+' Cette procédure pilote l'ensemble de l'export depuis Microsoft Project
+' jusqu'à la génération du fichier Excel.
+'===============================================================================
+
+Sub Export_Gantt_Style_MSP_Jour_Par_Ressource_V2()
+
+    '---------------------------------------------------------------------------
+    ' Constantes Excel et Office
+    '
+    ' Excel est ouvert avec CreateObject, sans ajouter manuellement de référence
+    ' Excel dans Microsoft Project. Cette méthode est appelée "late binding".
+    '
+    ' Les constantes Excel doivent donc être déclarées ici avec leurs valeurs
+    ' numériques pour pouvoir être utilisées dans le programme.
+    '---------------------------------------------------------------------------
+
+    Const XL_CENTER As Long = -4108
+    Const XL_THIN As Long = 2
+
+    Const XL_EDGE_LEFT As Long = 7
+    Const XL_CONTINUOUS As Long = 1
+    Const XL_DASH As Long = -4115
+    Const XL_MEDIUM As Long = -4138
+
+    Const MSO_CONNECTOR_STRAIGHT As Long = 1
+    Const MSO_ARROW_TRIANGLE As Long = 3
+
+
+    '---------------------------------------------------------------------------
+    ' Paramètres de mise en page
+    '
+    ' Les colonnes A à F contiennent les informations sur les tâches.
+    ' La frise temporelle commence en colonne G.
+    '
+    ' Une ligne vide est laissée entre les activités afin d'améliorer
+    ' la lisibilité du planning et le passage des liens de dépendance.
+    '---------------------------------------------------------------------------
+
+    Const COL_START_TIMELINE As Long = 7
+    Const HEADER_ROW As Long = 6
+    Const FIRST_TASK_ROW As Long = 7
+    Const ROW_STEP As Long = 2
+
+
+    '---------------------------------------------------------------------------
+    ' Déclaration des objets Microsoft Project et Excel
+    '---------------------------------------------------------------------------
+
+    Dim xlApp As Object
+    Dim xlWB As Object
+    Dim ws As Object
+
+    Dim res As Resource
+    Dim t As Task
+
+
+    '---------------------------------------------------------------------------
+    ' Variables utilisées pour construire la période du planning
+    '---------------------------------------------------------------------------
+
+    Dim FirstDate As Date
+    Dim LastDate As Date
+    Dim dt As Date
+
+    Dim Yr As Long
+    Dim Mo As Long
+
+    Dim prevYear As Long
+    Dim prevMonth As Long
+
+    Dim yearStartCol As Long
+    Dim monthStartCol As Long
+
+    Dim col As Long
+    Dim LastTimelineCol As Long
+
+
+    '---------------------------------------------------------------------------
+    ' Tableaux utilisés pour mémoriser la position des tâches
+    '
+    ' StartCol : colonne de début de la barre de Gantt.
+    ' EndCol   : colonne de fin de la barre.
+    ' TaskID   : identifiant Microsoft Project de la tâche.
+    ' SuccStr  : liste des successeurs de la tâche.
+    '
+    ' Ces informations sont conservées pour pouvoir dessiner les dépendances
+    ' après la création de toutes les barres.
+    '---------------------------------------------------------------------------
+
+    Dim StartCol(1 To 5000) As Long
+    Dim EndCol(1 To 5000) As Long
+    Dim TaskID(1 To 5000) As Long
+    Dim SuccStr(1 To 5000) As String
+
+    Dim rowIndex As Long
+    Dim lastRow As Long
+
+
+    '===========================================================================
+    ' OUVERTURE D'EXCEL
+    '===========================================================================
+
+    ' Démarrage d'une nouvelle instance d'Excel.
+    Set xlApp = CreateObject("Excel.Application")
+
+    ' Excel est rendu visible pour que l'utilisateur puisse suivre
+    ' progressivement la génération du fichier.
+    xlApp.Visible = True
+
+    ' Création du classeur qui contiendra les feuilles des ressources.
+    Set xlWB = xlApp.Workbooks.Add
+
+
+    '===========================================================================
+    ' RÉCUPÉRATION DE LA PÉRIODE DU PROJET
+    '===========================================================================
+
+    FirstDate = ActiveProject.ProjectStart
+    LastDate = ActiveProject.ProjectFinish
+
+    ' Sécurité au cas où les dates seraient inversées dans le projet.
+    If LastDate < FirstDate Then
+
+        Dim tmp As Date
+
+        tmp = FirstDate
+        FirstDate = LastDate
+        LastDate = tmp
+
+    End If
+
+
+    '===========================================================================
+    ' CRÉATION D'UNE FEUILLE POUR CHAQUE RESSOURCE
+    '===========================================================================
+
+    For Each res In ActiveProject.Resources
+
+        If Not res Is Nothing Then
+
+            If Trim$(res.Name) <> "" Then
+
+
+                ' Les collections suivantes mémorisent les colonnes où commencent
+                ' les semaines et les mois.
+                '
+                ' Elles seront utilisées plus tard pour ajouter les séparateurs
+                ' verticaux dans le planning.
+                Dim monthBoundaries As Collection
+                Dim weekBoundaries As Collection
+
+                Set monthBoundaries = New Collection
+                Set weekBoundaries = New Collection
+
+
+                '----------------------------------------------------------------
+                ' Création de la feuille de la ressource
+                '----------------------------------------------------------------
+
+                Set ws = xlWB.Worksheets.Add
+
+                ' Le nom de la ressource est nettoyé avant d'être utilisé
+                ' comme nom de feuille.
+                ws.Name = SafeSheetName(res.Name)
+
+
+                '----------------------------------------------------------------
+                ' Affichage du nom de la ressource
+                '----------------------------------------------------------------
+
+                ws.Range("A1").Value = "Ressource : " & res.Name
+                ws.Range("A1").Font.Bold = True
+                ws.Range("A1").Font.Size = 14
+
+
+                '----------------------------------------------------------------
+                ' Création des colonnes contenant les informations des tâches
+                '----------------------------------------------------------------
+
+                ws.Range("A" & HEADER_ROW & ":F" & HEADER_ROW).Value = _
+                    Array("ID", "Nom tâche", "Début", "Fin", _
+                          "% Complétion", "Projet")
+
+                ws.Range("A" & HEADER_ROW & ":F" & HEADER_ROW).Font.Bold = True
+
+                ws.Range("A" & HEADER_ROW & ":F" & HEADER_ROW).Interior.Color = _
+                    RGB(230, 230, 230)
+
+
+                '================================================================
+                ' CONSTRUCTION DE LA FRISE TEMPORELLE
+                '
+                ' Chaque jour du projet correspond à une colonne Excel.
+                '
+                ' Ligne 2 : année ;
+                ' Ligne 3 : mois ;
+                ' Ligne 4 : date affichée uniquement le lundi ;
+                ' Ligne 5 : initiale du jour.
+                '
+                ' Cette organisation reprend les principaux repères visuels
+                ' utilisés dans Microsoft Project.
+                '================================================================
+
+                col = COL_START_TIMELINE
+
+                prevYear = -1
+                prevMonth = -1
+
+                yearStartCol = COL_START_TIMELINE
+                monthStartCol = COL_START_TIMELINE
+
+
+                ' La frise est construite jour par jour sur toute la durée
+                ' du projet.
+                For dt = FirstDate To LastDate Step 1
+
+                    Yr = Year(dt)
+                    Mo = Month(dt)
+
+
+                    '------------------------------------------------------------
+                    ' Gestion des années
+                    '
+                    ' Lorsqu'une nouvelle année commence, les cellules appartenant
+                    ' à l'année précédente sont fusionnées.
+                    '------------------------------------------------------------
+
+                    If Yr <> prevYear Then
+
+                        If prevYear <> -1 Then
+
+                            If (col - 1) > yearStartCol Then
+
+                                ws.Range( _
+                                    ws.Cells(2, yearStartCol), _
+                                    ws.Cells(2, col - 1) _
+                                ).Merge
+
+                            End If
+
+                        End If
+
+                        yearStartCol = col
+
+                        ws.Cells(2, col).Value = Yr
+                        ws.Cells(2, col).HorizontalAlignment = XL_CENTER
+                        ws.Cells(2, col).Font.Bold = True
+
+                        prevYear = Yr
+
+                    End If
+
+
+                    '------------------------------------------------------------
+                    ' Gestion des mois
+                    '
+                    ' Lorsqu'un nouveau mois commence, les cellules du mois
+                    ' précédent sont fusionnées.
+                    '
+                    ' La première colonne du nouveau mois est également enregistrée
+                    ' afin d'y ajouter plus tard un séparateur vertical noir.
+                    '------------------------------------------------------------
+
+                    If Mo <> prevMonth Then
+
+                        If prevMonth <> -1 Then
+
+                            If (col - 1) > monthStartCol Then
+
+                                ws.Range( _
+                                    ws.Cells(3, monthStartCol), _
+                                    ws.Cells(3, col - 1) _
+                                ).Merge
+
+                            End If
+
+                            If Not CollectionContainsLong(monthBoundaries, col) Then
+                                monthBoundaries.Add col
+                            End If
+
+                        End If
+
+                        monthStartCol = col
+
+                        ws.Cells(3, col).Value = Format(dt, "mmmm")
+                        ws.Cells(3, col).HorizontalAlignment = XL_CENTER
+                        ws.Cells(3, col).Font.Bold = True
+
+                        prevMonth = Mo
+
+                    End If
+
+
+                    '------------------------------------------------------------
+                    ' Affichage de la date uniquement le lundi
+                    '
+                    ' Afficher une date complète tous les jours rendrait la frise
+                    ' trop chargée. Le lundi sert donc de repère hebdomadaire.
+                    '------------------------------------------------------------
+
+                    If Weekday(dt, vbMonday) = 1 Then
+
+                        ws.Cells(4, col).Value = Format(dt, "dd/mm")
+                        ws.Cells(4, col).HorizontalAlignment = XL_CENTER
+
+                        ' La colonne du lundi est mémorisée pour ajouter ensuite
+                        ' un séparateur hebdomadaire.
+                        If Not CollectionContainsLong(weekBoundaries, col) Then
+                            weekBoundaries.Add col
+                        End If
+
+                    Else
+
+                        ws.Cells(4, col).Value = ""
+
+                    End If
+
+
+                    ' Affichage de l'initiale du jour.
+                    ws.Cells(5, col).Value = DayLetterFR(dt)
+                    ws.Cells(5, col).HorizontalAlignment = XL_CENTER
+
+
+                    col = col + 1
+
+                    ' Une feuille Excel est limitée à 16 384 colonnes.
+                    ' Cette sécurité évite une erreur si la période est trop longue.
+                    If col > 16384 Then
+                        Exit For
+                    End If
+
+                Next dt
+
+
+                LastTimelineCol = col - 1
+
+
+                '----------------------------------------------------------------
+                ' Finalisation des cellules fusionnées
+                '
+                ' La boucle précédente fusionne les périodes terminées.
+                ' Il reste donc à fusionner la dernière année et le dernier mois.
+                '----------------------------------------------------------------
+
+                If LastTimelineCol >= COL_START_TIMELINE Then
+
+                    If LastTimelineCol > yearStartCol Then
+
+                        ws.Range( _
+                            ws.Cells(2, yearStartCol), _
+                            ws.Cells(2, LastTimelineCol) _
+                        ).Merge
+
+                    End If
+
+                    If LastTimelineCol > monthStartCol Then
+
+                        ws.Range( _
+                            ws.Cells(3, monthStartCol), _
+                            ws.Cells(3, LastTimelineCol) _
+                        ).Merge
+
+                    End If
+
+                End If
+
+
+                '----------------------------------------------------------------
+                ' Mise en forme des en-têtes de la frise
+                '----------------------------------------------------------------
+
+                ws.Range( _
+                    ws.Cells(2, COL_START_TIMELINE), _
+                    ws.Cells(5, LastTimelineCol) _
+                ).Interior.Color = RGB(242, 242, 242)
+
+                ws.Range( _
+                    ws.Cells(2, COL_START_TIMELINE), _
+                    ws.Cells(5, LastTimelineCol) _
+                ).Font.Bold = True
+
+                ' Les colonnes des jours sont volontairement étroites pour obtenir
+                ' un rendu proche d'un diagramme de Gantt.
+                ws.Range( _
+                    ws.Cells(5, COL_START_TIMELINE), _
+                    ws.Cells(5, LastTimelineCol) _
+                ).EntireColumn.ColumnWidth = 2#
+
+
+                '----------------------------------------------------------------
+                ' Mise en évidence des week-ends
+                '
+                ' Les colonnes des samedis et dimanches sont légèrement grisées
+                ' afin de faciliter la lecture du calendrier.
+                '----------------------------------------------------------------
+
+                Dim ccol As Long
+                Dim dTmp As Date
+
+                dTmp = FirstDate
+
+                For ccol = COL_START_TIMELINE To LastTimelineCol
+
+                    If Weekday(dTmp, vbMonday) >= 6 Then
+
+                        ws.Range( _
+                            ws.Cells(2, ccol), _
+                            ws.Cells(500, ccol) _
+                        ).Interior.Color = RGB(250, 250, 250)
+
+                    End If
+
+                    dTmp = dTmp + 1
+
+                Next ccol
+
+
+                '================================================================
+                ' PRÉPARATION DES TÂCHES DE LA RESSOURCE
+                '================================================================
+
+                rowIndex = FIRST_TASK_ROW
+
+
+                ' Réinitialisation des tableaux avant de traiter une nouvelle
+                ' ressource.
+                Dim i As Long
+
+                For i = 1 To 5000
+
+                    StartCol(i) = 0
+                    EndCol(i) = 0
+                    TaskID(i) = 0
+                    SuccStr(i) = ""
+
+                Next i
+
+
+                '----------------------------------------------------------------
+                ' Constitution de la liste des tâches à exporter
+                '
+                ' La macro ne conserve que les tâches :
+                ' - non récapitulatives ;
+                ' - affectées à la ressource étudiée ;
+                ' - possédant des dates valides ;
+                ' - dont la fin n'est pas antérieure au début.
+                '----------------------------------------------------------------
+
+                Dim taskList() As Object
+                Dim taskCount As Long
+
+                taskCount = 0
+
+
+                For Each t In ActiveProject.Tasks
+
+                    If Not t Is Nothing Then
+
+                        ' Les tâches récapitulatives sont écartées pour éviter
+                        ' d'afficher à la fois une synthèse et ses sous-tâches.
+                        If Not t.Summary Then
+
+                            If TaskHasResource(t, res) Then
+
+                                If IsDate(t.Start) And IsDate(t.Finish) Then
+
+                                    If Int(t.Finish) >= Int(t.Start) Then
+
+                                        taskCount = taskCount + 1
+
+                                        ReDim Preserve taskList(1 To taskCount)
+
+                                        Set taskList(taskCount) = t
+
+                                    End If
+
+                                End If
+
+                            End If
+
+                        End If
+
+                    End If
+
+                Next t
+
+
+                '================================================================
+                ' TRI CHRONOLOGIQUE DES TÂCHES
+                '
+                ' Les tâches sont classées selon leur date de début.
+                '
+                ' Lorsque deux tâches commencent le même jour, celle qui se
+                ' termine en premier est affichée en premier.
+                '
+                ' Ce classement rend la feuille plus simple à lire et limite
+                ' une partie des croisements entre les flèches.
+                '================================================================
+
+                Dim i1 As Long
+                Dim i2 As Long
+                Dim tempTask As Object
+
+
+                For i1 = 1 To taskCount - 1
+
+                    For i2 = i1 + 1 To taskCount
+
+                        If taskList(i2).Start < taskList(i1).Start _
+                        Or (taskList(i2).Start = taskList(i1).Start _
+                        And taskList(i2).Finish < taskList(i1).Finish) Then
+
+                            Set tempTask = taskList(i1)
+                            Set taskList(i1) = taskList(i2)
+                            Set taskList(i2) = tempTask
+
+                        End If
+
+                    Next i2
+
+                Next i1
+
+
+                '================================================================
+                ' AFFICHAGE DES TÂCHES ET CRÉATION DES BARRES DE GANTT
+                '================================================================
+
+                For i1 = 1 To taskCount
+
+                    Set t = taskList(i1)
+
+
+                    '------------------------------------------------------------
+                    ' Écriture des informations descriptives
+                    '------------------------------------------------------------
+
+                    ws.Cells(rowIndex, 1).Value = t.ID
+                    ws.Cells(rowIndex, 2).Value = t.Name
+                    ws.Cells(rowIndex, 3).Value = t.Start
+                    ws.Cells(rowIndex, 4).Value = t.Finish
+
+                    ' Microsoft Project renvoie une valeur comprise entre
+                    ' 0 et 100. Elle est divisée par 100 pour être affichée
+                    ' correctement au format pourcentage dans Excel.
+                    ws.Cells(rowIndex, 5).Value = t.PercentComplete / 100
+                    ws.Cells(rowIndex, 5).NumberFormat = "0%"
+
+                    ' Le champ personnalisé Text1 est utilisé pour indiquer
+                    ' le projet associé à la tâche.
+                    ws.Cells(rowIndex, 6).Value = t.Text1
+
+
+                    ' Mémorisation des données utilisées pour les dépendances.
+                    TaskID(rowIndex) = t.ID
+                    SuccStr(rowIndex) = t.Successors
+
+
+                    Dim isInactive As Boolean
+
+                    isInactive = (t.Active = False)
+
+
+                    If isInactive Then
+
+                        '--------------------------------------------------------
+                        ' Affichage d'une tâche inactive
+                        '
+                        ' La tâche reste visible afin de conserver l'historique,
+                        ' mais elle est grisée et barrée.
+                        '
+                        ' Aucune barre de Gantt n'est créée, car la tâche n'est
+                        ' plus considérée comme planifiée.
+                        '--------------------------------------------------------
+
+                        ws.Range( _
+                            ws.Cells(rowIndex, 1), _
+                            ws.Cells(rowIndex, 6) _
+                        ).Interior.Color = RGB(217, 217, 217)
+
+                        ws.Range( _
+                            ws.Cells(rowIndex, 1), _
+                            ws.Cells(rowIndex, 6) _
+                        ).Font.Strikethrough = True
+
+                        ws.Range( _
+                            ws.Cells(rowIndex, 1), _
+                            ws.Cells(rowIndex, 6) _
+                        ).Font.Color = RGB(120, 120, 120)
+
+                        ws.Range( _
+                            ws.Cells(rowIndex, COL_START_TIMELINE), _
+                            ws.Cells(rowIndex, LastTimelineCol) _
+                        ).Interior.Color = RGB(240, 240, 240)
+
+                        StartCol(rowIndex) = 0
+                        EndCol(rowIndex) = 0
+
+
+                    Else
+
+                        '--------------------------------------------------------
+                        ' Calcul de la position de la barre de Gantt
+                        '
+                        ' La différence entre la date de la tâche et la date de
+                        ' début du projet donne le nombre de colonnes à décaler.
+                        '--------------------------------------------------------
+
+                        StartCol(rowIndex) = _
+                            COL_START_TIMELINE + _
+                            (Int(t.Start) - FirstDate)
+
+                        EndCol(rowIndex) = _
+                            COL_START_TIMELINE + _
+                            (Int(t.Finish) - FirstDate)
+
+
+                        ' Si une tâche commence avant la période affichée,
+                        ' sa barre commence au début de la timeline.
+                        If StartCol(rowIndex) < COL_START_TIMELINE Then
+                            StartCol(rowIndex) = COL_START_TIMELINE
+                        End If
+
+                        ' Si une tâche se termine après la période affichée,
+                        ' sa barre est arrêtée à la dernière colonne visible.
+                        If EndCol(rowIndex) > LastTimelineCol Then
+                            EndCol(rowIndex) = LastTimelineCol
+                        End If
+
+
+                        '--------------------------------------------------------
+                        ' Création de la barre
+                        '
+                        ' Chaque cellule comprise entre le début et la fin
+                        ' de la tâche est colorée en bleu.
+                        '--------------------------------------------------------
+
+                        Dim cc As Long
+
+                        For cc = StartCol(rowIndex) To EndCol(rowIndex)
+
+                            ws.Cells(rowIndex, cc).Interior.Color = _
+                                RGB(91, 155, 213)
+
+                        Next cc
+
+                    End If
+
+
+                    ' Une ligne vide est laissée avant l'activité suivante.
+                    rowIndex = rowIndex + ROW_STEP
+
+                Next i1
+
+
+                lastRow = rowIndex - ROW_STEP
+
+
+                '================================================================
+                ' AJOUT DES SÉPARATEURS TEMPORELS
+                '
+                ' Les mois sont séparés par un trait noir épais.
+                ' Les semaines sont séparées par un trait gris pointillé.
+                '================================================================
+
+                Dim b As Variant
+
+
+                '----------------------------------------------------------------
+                ' Séparateurs mensuels
+                '----------------------------------------------------------------
+
+                For Each b In monthBoundaries
+
+                    With ws.Range( _
+                        ws.Cells(2, CLng(b)), _
+                        ws.Cells(lastRow, CLng(b)) _
+                    ).Borders(XL_EDGE_LEFT)
+
+                        .LineStyle = XL_CONTINUOUS
+                        .Weight = XL_MEDIUM
+                        .Color = RGB(0, 0, 0)
+
+                    End With
+
+                Next b
+
+
+                '----------------------------------------------------------------
+                ' Séparateurs hebdomadaires placés sur les lundis
+                '----------------------------------------------------------------
+
+                For Each b In weekBoundaries
+
+                    With ws.Range( _
+                        ws.Cells(2, CLng(b)), _
+                        ws.Cells(lastRow, CLng(b)) _
+                    ).Borders(XL_EDGE_LEFT)
+
+                        .LineStyle = XL_DASH
+                        .Weight = XL_THIN
+                        .Color = RGB(160, 160, 160)
+
+                    End With
+
+                Next b
+
+
+                '================================================================
+                ' RECONSTRUCTION DES DÉPENDANCES ENTRE LES TÂCHES
+                '
+                ' Les liens définis dans Microsoft Project sont recréés dans
+                ' Excel à l'aide de connecteurs.
+                '
+                ' Un lien est constitué de trois segments :
+                ' 1. une sortie horizontale depuis la fin de la première tâche ;
+                ' 2. un segment vertical reliant les deux lignes ;
+                ' 3. une entrée horizontale vers la tâche suivante.
+                '
+                ' Cette construction en escalier cherche à reproduire le rendu
+                ' visuel utilisé dans Microsoft Project.
+                '================================================================
+
+                Dim L1 As Long
+                Dim L2 As Long
+
+                Dim succ As String
+                Dim part As Variant
+                Dim succID As Long
+
+                Dim x1 As Double
+                Dim y1 As Double
+                Dim x2 As Double
+                Dim y2 As Double
+
+                Dim seg1 As Object
+                Dim seg2 As Object
+                Dim seg3 As Object
+
+                Dim elbowX As Double
+                Dim minElbow As Double
+
+
+                ' Parcours de toutes les tâches visibles dans la feuille.
+                For L1 = FIRST_TASK_ROW To lastRow Step ROW_STEP
+
+                    succ = SuccStr(L1)
+
+
+                    If Len(Trim$(succ)) > 0 Then
+
+                        Dim arr As Variant
+
+                        ' Une tâche pouvant avoir plusieurs successeurs,
+                        ' la chaîne est découpée avant leur traitement.
+                        arr = SplitSuccessors(succ)
+
+
+                        For Each part In arr
+
+                            ' Récupération de l'identifiant numérique.
+                            succID = ExtractID(CStr(part))
+
+
+                            If succID > 0 Then
+
+                                ' Recherche de la ligne correspondant au successeur.
+                                '
+                                ' Le lien est uniquement créé si le successeur est
+                                ' présent dans la feuille de la ressource actuelle.
+                                For L2 = FIRST_TASK_ROW To lastRow Step ROW_STEP
+
+                                    If TaskID(L2) = succID Then
+
+
+                                        '----------------------------------------
+                                        ' Point de départ du lien
+                                        '
+                                        ' Le lien part du milieu du bord droit
+                                        ' de la barre de la première tâche.
+                                        '----------------------------------------
+
+                                        x1 = ws.Cells( _
+                                            L1, EndCol(L1) _
+                                        ).Left + ws.Cells( _
+                                            L1, EndCol(L1) _
+                                        ).Width
+
+                                        y1 = ws.Cells( _
+                                            L1, EndCol(L1) _
+                                        ).Top + ws.Cells( _
+                                            L1, EndCol(L1) _
+                                        ).Height / 2
+
+
+                                        '----------------------------------------
+                                        ' Point d'arrivée du lien
+                                        '
+                                        ' La flèche arrive au milieu du bord
+                                        ' gauche de la barre du successeur.
+                                        '----------------------------------------
+
+                                        x2 = ws.Cells( _
+                                            L2, StartCol(L2) _
+                                        ).Left
+
+                                        y2 = ws.Cells( _
+                                            L2, StartCol(L2) _
+                                        ).Top + ws.Cells( _
+                                            L2, StartCol(L2) _
+                                        ).Height / 2
+
+
+                                        '----------------------------------------
+                                        ' Calcul de la position du coude
+                                        '
+                                        ' Le coude permet à la flèche d'entrer
+                                        ' par la gauche de la tâche successeur.
+                                        '----------------------------------------
+
+                                        If x2 > x1 Then
+
+                                            ' Cas classique : le successeur se
+                                            ' trouve à droite de la tâche source.
+                                            If (x2 - 18) > (x1 + 6) Then
+
+                                                ' Si l'espace est suffisant,
+                                                ' le coude est placé légèrement
+                                                ' avant la tâche suivante.
+                                                elbowX = x2 - 18
+
+                                            Else
+
+                                                ' Si les deux tâches sont très
+                                                ' proches, le coude est placé
+                                                ' juste avant le successeur.
+                                                elbowX = x2 - 2
+
+                                            End If
+
+                                        Else
+
+                                            ' Cas plus rare où le successeur est
+                                            ' situé à gauche de la tâche source.
+                                            '
+                                            ' Cela peut apparaître avec certains
+                                            ' types de liens ou des décalages
+                                            ' négatifs dans Microsoft Project.
+                                            elbowX = x2 + 18
+
+                                        End If
+
+
+                                        '----------------------------------------
+                                        ' Protection de la zone descriptive
+                                        '
+                                        ' Le coude ne doit pas traverser les
+                                        ' colonnes A à F contenant les noms et
+                                        ' les informations des tâches.
+                                        '----------------------------------------
+
+                                        minElbow = ws.Cells( _
+                                            2, COL_START_TIMELINE _
+                                        ).Left - 10
+
+                                        If elbowX < minElbow Then
+                                            elbowX = minElbow
+                                        End If
+
+
+                                        '----------------------------------------
+                                        ' Création du premier segment horizontal
+                                        '----------------------------------------
+
+                                        Set seg1 = ws.Shapes.AddConnector( _
+                                            MSO_CONNECTOR_STRAIGHT, _
+                                            x1, y1, elbowX, y1 _
+                                        )
+
+
+                                        '----------------------------------------
+                                        ' Création du segment vertical
+                                        '----------------------------------------
+
+                                        Set seg2 = ws.Shapes.AddConnector( _
+                                            MSO_CONNECTOR_STRAIGHT, _
+                                            elbowX, y1, elbowX, y2 _
+                                        )
+
+
+                                        '----------------------------------------
+                                        ' Création du dernier segment horizontal
+                                        '----------------------------------------
+
+                                        Set seg3 = ws.Shapes.AddConnector( _
+                                            MSO_CONNECTOR_STRAIGHT, _
+                                            elbowX, y2, x2, y2 _
+                                        )
+
+
+                                        ' La pointe de flèche est uniquement
+                                        ' ajoutée au dernier segment.
+                                        seg3.Line.EndArrowheadStyle = _
+                                            MSO_ARROW_TRIANGLE
+
+
+                                        ' Application d'une couleur noire aux
+                                        ' trois parties de la dépendance.
+                                        seg1.Line.ForeColor.RGB = RGB(0, 0, 0)
+                                        seg2.Line.ForeColor.RGB = RGB(0, 0, 0)
+                                        seg3.Line.ForeColor.RGB = RGB(0, 0, 0)
+
+
+                                        ' Réglage de l'épaisseur des traits.
+                                        seg1.Line.Weight = 1
+                                        seg2.Line.Weight = 1
+                                        seg3.Line.Weight = 1
+
+
+                                        ' La cible ayant été trouvée, la recherche
+                                        ' passe au successeur suivant.
+                                        Exit For
+
+                                    End If
+
+                                Next L2
+
+                            End If
+
+                        Next part
+
+                    End If
+
+                Next L1
+
+
+                '================================================================
+                ' MISE EN FORME FINALE DE LA FEUILLE
+                '
+                ' L'objectif est d'obtenir directement un fichier lisible sans
+                ' demander à l'utilisateur de refaire la mise en page.
+                '================================================================
+
+                ' Ajustement automatique de la largeur des colonnes descriptives.
+                ws.Columns("A:F").AutoFit
+
+
+                ' Réglage de la hauteur des lignes d'en-tête.
+                ws.Rows("2:" & HEADER_ROW).RowHeight = 18
+
+
+                ' Réglage de la hauteur des lignes contenant les activités.
+                ws.Rows(FIRST_TASK_ROW & ":" & lastRow).RowHeight = 16
+
+
+                ' Les lignes vides sont plus petites afin d'aérer le planning
+                ' sans utiliser trop d'espace vertical.
+                Dim rr As Long
+
+                For rr = FIRST_TASK_ROW + 1 To lastRow Step ROW_STEP
+                    ws.Rows(rr).RowHeight = 10
+                Next rr
+
+
+                '----------------------------------------------------------------
+                ' Ajout de bordures dans la partie descriptive
+                '----------------------------------------------------------------
+
+                Dim rngFix As Object
+
+                Set rngFix = ws.Range( _
+                    "A" & HEADER_ROW & ":F" & lastRow _
+                )
+
+                rngFix.Borders.LineStyle = 1
+                rngFix.Borders.Weight = XL_THIN
+                rngFix.Borders.Color = RGB(200, 200, 200)
+
+
+                '----------------------------------------------------------------
+                ' Gel des volets
+                '
+                ' Les en-têtes et les colonnes descriptives restent visibles
+                ' lorsque l'utilisateur se déplace dans une longue timeline.
+                '----------------------------------------------------------------
+
+                ws.Activate
+
+                xlApp.ActiveWindow.SplitRow = HEADER_ROW
+                xlApp.ActiveWindow.SplitColumn = 6
+                xlApp.ActiveWindow.FreezePanes = True
+
+
+            End If
+
+        End If
+
+    Next res
+
+
+    '===========================================================================
+    ' FIN DE L'EXPORT
+    '===========================================================================
+
+    MsgBox _
+        "Export journalier terminé." & vbCrLf & _
+        "Une feuille a été créée pour chaque ressource avec :" & vbCrLf & _
+        "- les tâches triées chronologiquement ;" & vbCrLf & _
+        "- les barres de Gantt ;" & vbCrLf & _
+        "- les séparateurs hebdomadaires et mensuels ;" & vbCrLf & _
+        "- les dépendances entre les tâches.", _
+        vbInformation
+
+End Sub
+
